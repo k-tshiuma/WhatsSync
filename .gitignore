@@ -1,0 +1,33 @@
+# Credentials and config files
+.env
+client_secrets.json
+
+# Python virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local database / token caching
+data/token.pickle
+data/*.pickle
+data/*.json
+
+# Local sessions
+whatsapp_session/
+
+# Logs
+logs/
+*.log
+
+# PyInstaller / Build outputs
+build/
+dist/
+gui.spec
+*.spec

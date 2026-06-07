@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+google-api-python-client
+google-auth
+google-auth-oauthlib
+selenium
+phonenumbers
+pydantic-settings
+python-dotenv
+webdriver_manager
+jinja2
+customtkinter
+pyinstaller

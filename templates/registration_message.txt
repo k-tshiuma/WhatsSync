@@ -1,0 +1,10 @@
+Hello {{name}},
+
+Registration for the new semester has started.
+
+Please see the attached flyer for details.
+
+Join the WhatsApp group here:
+{{group_link}}
+
+Thank you.

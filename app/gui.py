@@ -9,10 +9,11 @@ from app.config.settings import settings
 from app.utils.logger import logger
 from app.integrations.google_contacts import (
     get_people_service, list_contact_labels, get_contacts_from_label,
-    load_cached_credentials, get_account_email, sign_out, client_secrets_present
+    load_cached_credentials, get_account_email, sign_out, client_secrets_present,
+    get_label_member_count
 )
 from app.services.contact_service import validate_and_deduplicate_contacts
-from app.services.whatsapp_message_builder import build_registration_message
+from app.services.whatsapp_message_builder import build_registration_message, render_caption
 from app.integrations.whatsapp_automation import WhatsAppAutomation
 
 # Modern Dark Theme Palette
@@ -90,6 +91,217 @@ class TextboxLogHandler(logging.Handler):
             self.textbox.see("end")
         except Exception:
             pass
+
+class CampaignDialog(ctk.CTkToplevel):
+    """Modal shown on START TASK to name the campaign and choose its attachment before it runs."""
+    NAME_MAX = 80
+    DESCRIPTION_MAX = 250
+    # WhatsApp's own caption limit
+    CAPTION_MAX = 1024
+    ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".pdf")
+
+    def __init__(self, master, label_name, contact_count, on_confirm, default_attachment=""):
+        super().__init__(master)
+        self.on_confirm = on_confirm
+        self.label_name = label_name
+
+        self.title("New Campaign")
+        self.configure(fg_color=BG_COLOR)
+        self.resizable(False, False)
+        self.transient(master)
+
+        card = ctk.CTkFrame(self, fg_color=CARD_BG, border_color=CARD_BORDER, border_width=1, corner_radius=12)
+        card.pack(padx=16, pady=16, fill="both", expand=True)
+
+        title_lbl = ctk.CTkLabel(card, text="📢  New Campaign", font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"), text_color="#FFFFFF")
+        title_lbl.pack(padx=24, pady=(22, 2), anchor="w")
+        desc_lbl = ctk.CTkLabel(card, text="Name this run and choose what to send with the message.", font=ctk.CTkFont(family="Segoe UI", size=12), text_color=TEXT_MUTED)
+        desc_lbl.pack(padx=24, pady=(0, 16), anchor="w")
+
+        # Selected label and its contact count
+        info_box = ctk.CTkFrame(card, fg_color="#101726", corner_radius=8)
+        info_box.pack(padx=24, pady=(0, 16), fill="x")
+        info_box.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(info_box, text="CONTACT LABEL", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=TEXT_MUTED).grid(row=0, column=0, padx=15, pady=(12, 4), sticky="w")
+        ctk.CTkLabel(info_box, text=label_name, font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color=TEXT_PRIMARY).grid(row=0, column=1, padx=15, pady=(12, 4), sticky="e")
+        ctk.CTkLabel(info_box, text="CONTACTS", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=TEXT_MUTED).grid(row=1, column=0, padx=15, pady=(4, 12), sticky="w")
+        self.count_lbl = ctk.CTkLabel(info_box, text="", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"))
+        self.count_lbl.grid(row=1, column=1, padx=15, pady=(4, 12), sticky="e")
+
+        # Campaign name (required)
+        ctk.CTkLabel(card, text="Campaign Name", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(padx=24, pady=(0, 4), anchor="w")
+        self.name_input = ctk.CTkEntry(card, placeholder_text="e.g. Spring Semester Registration", height=38, fg_color=INPUT_BG, border_color=INPUT_BORDER, text_color=TEXT_PRIMARY)
+        self.name_input.pack(padx=24, pady=(0, 12), fill="x")
+
+        # Short description (optional, length-limited)
+        desc_header = ctk.CTkFrame(card, fg_color="transparent")
+        desc_header.pack(padx=24, pady=(0, 4), fill="x")
+        ctk.CTkLabel(desc_header, text="Short Description (optional)", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(side="left")
+        self.desc_counter_lbl = ctk.CTkLabel(desc_header, text=f"0 / {self.DESCRIPTION_MAX}", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
+        self.desc_counter_lbl.pack(side="right")
+
+        self.desc_input = ctk.CTkTextbox(card, height=60, fg_color=INPUT_BG, border_color=INPUT_BORDER, border_width=2, text_color=TEXT_PRIMARY, wrap="word", font=ctk.CTkFont(family="Segoe UI", size=13))
+        self.desc_input.pack(padx=24, pady=(0, 12), fill="x")
+        self.desc_input.bind("<KeyRelease>", lambda e: self._enforce_limit(self.desc_input, self.DESCRIPTION_MAX, self.desc_counter_lbl))
+
+        # Attachment (optional): image or PDF sent after the message
+        ctk.CTkLabel(card, text="Attachment (optional)", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(padx=24, pady=(0, 4), anchor="w")
+        attach_row = ctk.CTkFrame(card, fg_color="transparent")
+        attach_row.pack(padx=24, pady=(0, 2), fill="x")
+        attach_row.grid_columnconfigure(0, weight=1)
+
+        self.attachment_input = ctk.CTkEntry(attach_row, placeholder_text="No file selected", height=38, fg_color=INPUT_BG, border_color=INPUT_BORDER, text_color=TEXT_PRIMARY)
+        self.attachment_input.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.attachment_input.bind("<KeyRelease>", lambda e: self._update_caption_state())
+
+        browse_btn = ctk.CTkButton(
+            attach_row, text="Browse", width=80, height=38, fg_color="transparent", hover_color="#1E293B", text_color="#FFFFFF",
+            border_color="#374151", border_width=1, font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), command=self._browse_attachment
+        )
+        browse_btn.grid(row=0, column=1, padx=(0, 8))
+
+        clear_btn = ctk.CTkButton(
+            attach_row, text="✕", width=38, height=38, fg_color="transparent", hover_color="#271C22", text_color=ACCENT_RED,
+            border_color="#374151", border_width=1, font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), command=self._clear_attachment
+        )
+        clear_btn.grid(row=0, column=2)
+
+        ctk.CTkLabel(card, text="PNG, JPG, JPEG or PDF", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED).pack(padx=24, pady=(0, 8), anchor="w")
+
+        # Caption shown under the attachment
+        caption_header = ctk.CTkFrame(card, fg_color="transparent")
+        caption_header.pack(padx=24, pady=(0, 4), fill="x")
+        ctk.CTkLabel(caption_header, text="Attachment Caption (optional)", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(side="left")
+        self.caption_counter_lbl = ctk.CTkLabel(caption_header, text=f"0 / {self.CAPTION_MAX}", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
+        self.caption_counter_lbl.pack(side="right")
+
+        self.caption_input = ctk.CTkTextbox(card, height=60, fg_color=INPUT_BG, border_color=INPUT_BORDER, border_width=2, text_color=TEXT_PRIMARY, wrap="word", font=ctk.CTkFont(family="Segoe UI", size=13))
+        self.caption_input.pack(padx=24, pady=(0, 2), fill="x")
+        self.caption_input.bind("<KeyRelease>", lambda e: self._enforce_limit(self.caption_input, self.CAPTION_MAX, self.caption_counter_lbl))
+        self.caption_hint_lbl = ctk.CTkLabel(card, text="Use {{name}} to insert each contact's name.", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
+        self.caption_hint_lbl.pack(padx=24, pady=(0, 6), anchor="w")
+
+        if default_attachment:
+            self.attachment_input.insert(0, default_attachment)
+        self._update_caption_state()
+
+        self.error_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=ACCENT_RED)
+        self.error_lbl.pack(padx=24, pady=(0, 6), anchor="w")
+
+        # Actions
+        actions = ctk.CTkFrame(card, fg_color="transparent")
+        actions.pack(padx=24, pady=(0, 22), fill="x")
+        actions.grid_columnconfigure((0, 1), weight=1)
+
+        cancel_btn = ctk.CTkButton(
+            actions, text="Cancel", height=40, fg_color="transparent", hover_color="#1E293B", text_color="#FFFFFF",
+            border_color="#374151", border_width=1, font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), command=self.destroy
+        )
+        cancel_btn.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        self.confirm_btn = ctk.CTkButton(
+            actions, text="▶  START CAMPAIGN", height=40, fg_color=ACCENT_GREEN, hover_color="#0D9488", text_color="#FFFFFF",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), command=self._confirm
+        )
+        self.confirm_btn.grid(row=0, column=1, padx=(6, 0), sticky="ew")
+
+        self.set_contact_count(contact_count, checking=True)
+
+        self.name_input.bind("<Return>", lambda e: self._confirm())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        # Center over the main window, then make modal once it is visible
+        self.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_reqwidth()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_reqheight()) // 2
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.after(100, self._make_modal)
+
+    EMPTY_LABEL_ERROR = "This label has no contacts. Choose another label."
+
+    def set_contact_count(self, contact_count, checking=False):
+        """Show the label's contact count; checking=True marks it as cached while a fresh count loads."""
+        text = f"{contact_count:,} contact{'' if contact_count == 1 else 's'}"
+        if checking:
+            text += "  (checking...)"
+        self.count_lbl.configure(text=text, text_color=ACCENT_GREEN if contact_count else ACCENT_RED)
+
+        if contact_count:
+            # Only clear the empty-label error, not a validation error the user is looking at
+            if self.error_lbl.cget("text") == self.EMPTY_LABEL_ERROR:
+                self.error_lbl.configure(text="")
+            self.confirm_btn.configure(state="normal")
+        else:
+            self.error_lbl.configure(text=self.EMPTY_LABEL_ERROR)
+            self.confirm_btn.configure(state="disabled")
+
+    def _make_modal(self):
+        try:
+            self.grab_set()
+            self.lift()
+            self.name_input.focus_set()
+        except Exception:
+            pass
+
+    def _enforce_limit(self, textbox, max_chars, counter_lbl):
+        text = textbox.get("1.0", "end-1c")
+        if len(text) > max_chars:
+            textbox.delete(f"1.0+{max_chars}c", "end")
+            text = text[:max_chars]
+        counter_lbl.configure(text=f"{len(text)} / {max_chars}")
+
+    def _browse_attachment(self):
+        filename = filedialog.askopenfilename(
+            parent=self,
+            title="Select Attachment",
+            filetypes=[("Images and PDF", "*.png *.jpg *.jpeg *.pdf"), ("Images", "*.png *.jpg *.jpeg"), ("PDF", "*.pdf")]
+        )
+        if filename:
+            self.attachment_input.delete(0, "end")
+            self.attachment_input.insert(0, filename)
+            self._update_caption_state()
+
+    def _clear_attachment(self):
+        self.attachment_input.delete(0, "end")
+        self._update_caption_state()
+
+    def _update_caption_state(self):
+        # A caption only makes sense with an attachment
+        has_attachment = bool(self.attachment_input.get().strip())
+        self.caption_input.configure(state="normal" if has_attachment else "disabled",
+                                     text_color=TEXT_PRIMARY if has_attachment else TEXT_MUTED)
+
+    def _confirm(self):
+        if self.confirm_btn.cget("state") == "disabled":
+            return
+        name = self.name_input.get().strip()
+        if not name:
+            self.error_lbl.configure(text="Please enter a campaign name.")
+            self.name_input.focus_set()
+            return
+        if len(name) > self.NAME_MAX:
+            self.error_lbl.configure(text=f"Campaign name must be {self.NAME_MAX} characters or fewer.")
+            return
+        self._enforce_limit(self.desc_input, self.DESCRIPTION_MAX, self.desc_counter_lbl)
+        description = self.desc_input.get("1.0", "end-1c").strip()
+
+        attachment = self.attachment_input.get().strip()
+        caption = ""
+        if attachment:
+            attachment = os.path.abspath(attachment)
+            if not attachment.lower().endswith(self.ATTACHMENT_EXTENSIONS):
+                self.error_lbl.configure(text="Attachment must be a PNG, JPG, JPEG or PDF file.")
+                return
+            if not os.path.isfile(attachment):
+                self.error_lbl.configure(text="Attachment file not found.")
+                return
+            self._enforce_limit(self.caption_input, self.CAPTION_MAX, self.caption_counter_lbl)
+            caption = self.caption_input.get("1.0", "end-1c").strip()
+
+        self.destroy()
+        self.on_confirm(self.label_name, name, description, attachment or None, caption)
+
 
 class App(ctk.CTk):
     def __init__(self):
@@ -512,7 +724,7 @@ class App(ctk.CTk):
 
         self.seq_name_lbl = ctk.CTkLabel(
             title_box,
-            text="Active Sequence: 'Idle'",
+            text="Active Campaign: 'Idle'",
             font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color=TEXT_MUTED
         )
@@ -1122,17 +1334,23 @@ class App(ctk.CTk):
             self._refresh_account_status_worker()
 
     def _populate_labels_dropdown(self, values):
+        # Keep the user's choice across refreshes if that label still exists
+        current = self.label_dropdown.get()
+        selected = current if current in values else (values[0] if values else "")
         self.label_dropdown.configure(values=values)
-        self.label_dropdown.set(values[0] if values else "")
-        # set() doesn't fire the dropdown command, so refresh the count for the default label
-        if values:
-            self.on_label_selected(values[0])
+        self.label_dropdown.set(selected)
+        # set() doesn't fire the dropdown command, so refresh the count for the selected label
+        if selected:
+            self.on_label_selected(selected)
 
-    def on_label_selected(self, label_name):
-        group = next(
+    def _find_label(self, label_name):
+        return next(
             (g for g in self.labels_list if g.get('formattedName', g.get('name', 'Unnamed Label')) == label_name),
             None
         )
+
+    def on_label_selected(self, label_name):
+        group = self._find_label(label_name)
         if not group:
             return
         # memberCount is omitted by the API when the label is empty
@@ -1288,6 +1506,48 @@ class App(ctk.CTk):
         if selected_label == "Click 'Refresh Google Contacts'" or not selected_label:
             self.textbox_log("SYSTEM: Error - Please select a valid Google Contact label first.")
             return
+        if self.running_thread and self.running_thread.is_alive():
+            return
+
+        group = self._find_label(selected_label)
+        contact_count = group.get('memberCount', 0) if group else 0
+        # Pre-fill the attachment with the flyer from Settings, if it exists and is a supported type
+        default_attachment = settings.RESOLVED_FLYER_PATH
+        if not (os.path.isfile(default_attachment) and default_attachment.lower().endswith(CampaignDialog.ATTACHMENT_EXTENSIONS)):
+            default_attachment = ""
+        dialog = CampaignDialog(self, selected_label, contact_count, on_confirm=self._launch_campaign, default_attachment=default_attachment)
+
+        # The cached count dates from the last label refresh, so re-check it with Google
+        if group and group.get('resourceName'):
+            threading.Thread(target=self._refresh_label_count_worker, args=(group, dialog), daemon=True).start()
+        else:
+            dialog.set_contact_count(contact_count)
+
+    def _refresh_label_count_worker(self, group, dialog):
+        try:
+            count = get_label_member_count(get_people_service(), group['resourceName'])
+        except Exception as e:
+            logger.warning(f"SYNC: Could not refresh contact count for '{group.get('formattedName')}': {e}")
+            count = group.get('memberCount', 0)
+        self.after(0, self._apply_label_count, group, dialog, count)
+
+    def _apply_label_count(self, group, dialog, count):
+        group['memberCount'] = count
+        name = group.get('formattedName', group.get('name', 'Unnamed Label'))
+        if self.label_dropdown.get() == name:
+            self.on_label_selected(name)
+        # The user may have closed the window while the count was loading
+        if dialog.winfo_exists():
+            dialog.set_contact_count(count)
+
+    def _launch_campaign(self, selected_label, campaign_name, campaign_description, attachment_path, caption):
+        self.textbox_log(f"SYSTEM: Campaign '{campaign_name}' started on label '{selected_label}'.")
+        if campaign_description:
+            self.textbox_log(f"SYSTEM: Campaign description: {campaign_description}")
+        if attachment_path:
+            self.textbox_log(f"SYSTEM: Attachment: {os.path.basename(attachment_path)}" + (" (with caption)" if caption else ""))
+        else:
+            self.textbox_log("SYSTEM: No attachment. Sending text messages only.")
 
         # Ensure active settings are saved first
         self.save_current_settings()
@@ -1308,14 +1568,14 @@ class App(ctk.CTk):
         self.failures_count = 0
         self.total_contacts_count = 0
 
-        self.seq_name_lbl.configure(text=f"Active Sequence: '{selected_label} Broadcast'")
+        self.seq_name_lbl.configure(text=f"Active Campaign: '{campaign_name}'")
         self.running_badge_lbl.configure(text="●  RUNNING", text_color="#3B82F6")
         self.running_badge.configure(fg_color="#1A2D42")
 
         # Spawn dispatcher thread
         self.running_thread = threading.Thread(
             target=self._automation_worker,
-            args=(selected_label,),
+            args=(selected_label, attachment_path, caption),
             daemon=True
         )
         self.running_thread.start()
@@ -1323,7 +1583,7 @@ class App(ctk.CTk):
         # Start timer updates
         self.after(1000, self.update_timer)
 
-    def _automation_worker(self, label_name):
+    def _automation_worker(self, label_name, attachment_path=None, caption=""):
         try:
             logger.info("SYSTEM: Initializing automation sequence...")
             
@@ -1413,12 +1673,11 @@ class App(ctk.CTk):
 
                 self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Logged In. Preparing to dispatch..."))
                 
-                flyer_to_attach = os.path.abspath(settings.RESOLVED_FLYER_PATH)
-                if not os.path.exists(flyer_to_attach):
-                    logger.warning(f"SYSTEM: Flyer file not found at '{flyer_to_attach}'. Sending messages without attachment.")
-                    flyer_to_attach = None
-                else:
-                    logger.info(f"DEBUG: Loading media asset '{os.path.basename(flyer_to_attach)}' ({os.path.getsize(flyer_to_attach)/(1024*1024):.1f}MB)")
+                if attachment_path and not os.path.exists(attachment_path):
+                    logger.warning(f"SYSTEM: Attachment not found at '{attachment_path}'. Sending messages without attachment.")
+                    attachment_path = None
+                elif attachment_path:
+                    logger.info(f"DEBUG: Loading attachment '{os.path.basename(attachment_path)}' ({os.path.getsize(attachment_path)/(1024*1024):.1f}MB)")
 
                 # Step 5: Send Messages loop
                 for i, contact in enumerate(processed_contacts):
@@ -1449,7 +1708,11 @@ class App(ctk.CTk):
                     self.prog_count_lbl.after(0, lambda count=i+1, total=self.total_contacts_count: self.prog_count_lbl.configure(text=f"{count} / {total} Processed"))
 
                     logger.info(f"TASK: Sending message to {student_name} ({student_phone})")
-                    success = wa_automation.send_message(student_phone, message, flyer_path=flyer_to_attach)
+                    success = wa_automation.send_message(
+                        student_phone, message,
+                        attachment_path=attachment_path,
+                        caption=render_caption(caption, student_name) if caption else None
+                    )
                     
                     if success:
                         self.sent_count += 1

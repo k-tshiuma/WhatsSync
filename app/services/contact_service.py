@@ -3,7 +3,9 @@ from typing import List, Dict, Any
 from app.config.settings import settings
 from app.utils.logger import logger
 
-def normalize_phone_number(phone_number: str, default_country: str = settings.DEFAULT_COUNTRY) -> str | None:
+def normalize_phone_number(phone_number: str, default_country: str | None = None) -> str | None:
+    # Read at call time so a country changed in the GUI applies without a restart
+    default_country = default_country or settings.DEFAULT_COUNTRY
     try:
         parsed_number = phonenumbers.parse(phone_number, default_country)
         if phonenumbers.is_valid_number(parsed_number):

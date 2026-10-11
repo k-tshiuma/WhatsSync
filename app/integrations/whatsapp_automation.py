@@ -5,12 +5,21 @@ from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 from app.config.settings import settings
 from app.utils.logger import logger
+
+SEND_BUTTON_SELECTORS = [
+    'span[data-testid="send"]',
+    'div[aria-label="Send"]',
+    'button[aria-label="Send"]',
+    'span[data-icon="send"]',
+    'span[data-icon="wds-ic-send-filled"]'
+]
 
 class WhatsAppAutomation:
     def __init__(self):
@@ -34,6 +43,21 @@ class WhatsAppAutomation:
         self.driver.get("https://web.whatsapp.com/")
         logger.info("Browser launched. Waiting for WhatsApp Web to load.")
 
+    def _wait_for_any(self, css_selectors, clickable=False):
+        # Joined into one CSS selector list so a stale selector doesn't cost a full timeout each
+        combined = ", ".join(css_selectors)
+        condition = EC.element_to_be_clickable if clickable else EC.presence_of_element_located
+        return self.wait.until(condition((By.CSS_SELECTOR, combined)))
+
+    def _type_message(self, element, message: str):
+        # A raw "\n" presses Enter, which sends each line as a separate message; use Shift+Enter
+        lines = message.split("\n")
+        for i, line in enumerate(lines):
+            if line:
+                element.send_keys(line)
+            if i < len(lines) - 1:
+                element.send_keys(Keys.SHIFT, Keys.ENTER)
+
     def wait_for_login(self):
         try:
             # Wait until the main chat list element or search box is visible, indicating successful login
@@ -53,14 +77,19 @@ class WhatsAppAutomation:
         logger.info(f"Attempting to send message to {recipient_phone}")
         try:
             # Open chat with the recipient
-            self.driver.get(f"https://web.whatsapp.com/send?phone={recipient_phone}")
+            # A raw "+" in the query string decodes to a space, so pass digits only
+            self.driver.get(f"https://web.whatsapp.com/send?phone={recipient_phone.lstrip('+')}")
             time.sleep(5) # Give WhatsApp Web time to load the chat
 
             # Wait for the message input box to be present
             # Using a more robust selector for the message input box
-            message_box_selector = 'div[data-testid="conversation-compose-box-input"]'
-            message_box = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, message_box_selector)))
-            message_box.send_keys(message)
+            message_box = self._wait_for_any([
+                'div[data-testid="conversation-compose-box-input"]',
+                'footer div[contenteditable="true"][role="textbox"]',
+                'div[aria-label="Type a message"][contenteditable="true"]',
+                'footer div[contenteditable="true"]'
+            ])
+            self._type_message(message_box, message)
             time.sleep(1) # Small delay after typing message
 
             if flyer_path and os.path.exists(flyer_path):
@@ -68,12 +97,10 @@ class WhatsAppAutomation:
 
             # Click the send button (with robust fallbacks)
             send_button = None
-            for selector in ['span[data-testid="send"]', 'div[aria-label="Send"]', 'span[data-icon="send"]']:
-                try:
-                    send_button = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-                    break
-                except TimeoutException:
-                    continue
+            try:
+                send_button = self._wait_for_any(SEND_BUTTON_SELECTORS, clickable=True)
+            except TimeoutException:
+                pass
 
             if not send_button:
                 try:
@@ -104,15 +131,15 @@ class WhatsAppAutomation:
                 'div[aria-label="Attach"]',
                 'button[aria-label="Attach"]',
                 'div[data-testid="clip"]',
-                'span[data-icon="attach-menu-plus"]'
+                'span[data-icon="attach-menu-plus"]',
+                'span[data-icon="plus-rounded"]',
+                'button[title="Attach"]'
             ]
             attach_button = None
-            for selector in attach_selectors:
-                try:
-                    attach_button = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-                    break
-                except TimeoutException:
-                    continue
+            try:
+                attach_button = self._wait_for_any(attach_selectors, clickable=True)
+            except TimeoutException:
+                pass
 
             if not attach_button:
                 try:
@@ -131,11 +158,10 @@ class WhatsAppAutomation:
                 'input[type="file"]'
             ]
             for selector in input_selectors:
-                try:
-                    upload_input = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+                found = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if found:
+                    upload_input = found[0]
                     break
-                except TimeoutException:
-                    continue
 
             if not upload_input:
                 try:
@@ -150,12 +176,10 @@ class WhatsAppAutomation:
 
             # Click the final send button for the attachment (with robust fallbacks)
             send_attachment_button = None
-            for selector in ['span[data-testid="send"]', 'div[aria-label="Send"]', 'span[data-icon="send"]']:
-                try:
-                    send_attachment_button = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-                    break
-                except TimeoutException:
-                    continue
+            try:
+                send_attachment_button = self._wait_for_any(SEND_BUTTON_SELECTORS, clickable=True)
+            except TimeoutException:
+                pass
 
             if not send_attachment_button:
                 try:
@@ -183,9 +207,10 @@ if __name__ == '__main__':
     # This part is for direct testing and would not be part of the main app flow.
     # Ensure .env is configured and a valid phone number is provided.
     # Create a dummy flyer for testing
-    dummy_flyer_path = os.path.join(settings.session_path, "test_flyer.png")
+    dummy_flyer_path = os.path.join(settings.BASE_PATH, "data", "test_flyer.png")
     try:
         from PIL import Image
+        os.makedirs(os.path.dirname(dummy_flyer_path), exist_ok=True)
         img = Image.new('RGB', (60, 30), color = 'red')
         img.save(dummy_flyer_path)
         logger.info(f"Created dummy flyer at {dummy_flyer_path}")

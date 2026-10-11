@@ -1,5 +1,6 @@
 import time
 import os
+import psutil
 from selenium import webdriver
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.chrome.service import Service
@@ -42,6 +43,47 @@ POPUP_SELECTORS = [
 # Popup buttons that are safe to press to get a dialog out of the way
 SAFE_POPUP_BUTTONS = ["ok", "got it", "close", "not now", "continue", "dismiss", "skip", "use here", "later"]
 
+# Attach menu items, as labelled in English WhatsApp Web
+PHOTOS_MENU_LABELS = ["Photos & videos", "Photos & Videos", "Photos and videos"]
+DOCUMENT_MENU_LABELS = ["Document", "Documents"]
+
+# While an attach-menu item is clicked, keep the file input WhatsApp opens instead of
+# showing the OS file picker (which Selenium cannot drive). The input is put in the page
+# if WhatsApp created it detached, so a file can be sent to it.
+CAPTURE_FILE_INPUT_JS = """
+window.__wsCapturedInput = null;
+if (!window.__wsOrigInputClick) {
+    window.__wsOrigInputClick = HTMLInputElement.prototype.click;
+    window.__wsOrigShowPicker = HTMLInputElement.prototype.showPicker;
+    const capture = function () {
+        if (this.type !== 'file') {
+            return window.__wsOrigInputClick.apply(this, arguments);
+        }
+        if (!this.isConnected) {
+            this.style.display = 'none';
+            document.body.appendChild(this);
+        }
+        window.__wsCapturedInput = this;
+    };
+    HTMLInputElement.prototype.click = capture;
+    if (window.__wsOrigShowPicker) {
+        HTMLInputElement.prototype.showPicker = function () {
+            if (this.type === 'file') { return capture.call(this); }
+            return window.__wsOrigShowPicker.apply(this, arguments);
+        };
+    }
+}
+"""
+
+RESTORE_FILE_INPUT_JS = """
+if (window.__wsOrigInputClick) {
+    HTMLInputElement.prototype.click = window.__wsOrigInputClick;
+    if (window.__wsOrigShowPicker) { HTMLInputElement.prototype.showPicker = window.__wsOrigShowPicker; }
+    window.__wsOrigInputClick = null;
+    window.__wsOrigShowPicker = null;
+}
+"""
+
 def _xpath_literal(value: str) -> str:
     """Quote a string for use in XPath, including names that contain quotes."""
     if "'" not in value:
@@ -59,7 +101,48 @@ class WhatsAppAutomation:
         self.session_path = settings.RESOLVED_WHATSAPP_SESSION_PATH
         os.makedirs(self.session_path, exist_ok=True)
 
+    def close_leftover_browsers(self):
+        """Close Chrome still using this WhatsApp profile (e.g. from a run whose app was closed).
+
+        Chrome allows one process per profile, so a leftover one makes the next launch fail
+        with "Chrome failed to start: crashed". Only Chrome started with this exact
+        --user-data-dir is touched, plus the chromedriver that launched it.
+        """
+        profile = os.path.normcase(os.path.abspath(self.session_path))
+        leftovers = []
+        for proc in psutil.process_iter(["name", "cmdline"]):
+            try:
+                if (proc.info["name"] or "").lower() not in ("chrome.exe", "chrome"):
+                    continue
+                for arg in proc.info["cmdline"] or []:
+                    if arg.startswith("--user-data-dir=") and \
+                            os.path.normcase(os.path.abspath(arg.split("=", 1)[1].strip('"'))) == profile:
+                        leftovers.append(proc)
+                        break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        if not leftovers:
+            return
+
+        logger.warning(f"Closing a WhatsApp browser left open by a previous run ({len(leftovers)} Chrome process(es)).")
+        drivers = set()
+        for proc in leftovers:
+            try:
+                parent = proc.parent()
+                if parent and "chromedriver" in (parent.name() or "").lower():
+                    drivers.add(parent)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        for proc in list(drivers) + leftovers:
+            try:
+                proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        psutil.wait_procs(list(drivers) + leftovers, timeout=5)
+        time.sleep(1) # Let Chrome release the profile lock
+
     def launch_browser(self):
+        self.close_leftover_browsers()
         logger.info("Launching Chrome browser for WhatsApp Web automation...")
         options = Options()
         # Set user data directory for persistent session
@@ -316,32 +399,9 @@ class WhatsAppAutomation:
             attach_button.click()
             time.sleep(1.5) # Give time for attachment options to appear
 
-            # Find the hidden file input. Images go through the "Photos & videos" input;
-            # anything else (PDF) must use the "Document" input, which accepts any type.
-            if is_image:
-                input_selectors = [
-                    'input[accept*="image/"]',
-                    'input[type="file"][accept*="image"]',
-                    'input[type="file"]'
-                ]
-            else:
-                input_selectors = [
-                    'input[type="file"][accept="*"]',
-                    'input[type="file"]:not([accept*="image"])'
-                ]
-            upload_input = None
-            for selector in input_selectors:
-                found = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                if found:
-                    upload_input = found[0]
-                    break
-
+            upload_input = self._find_upload_input(is_image)
             if not upload_input:
-                xpath = "//input[@type='file']" if is_image else "//input[@type='file' and not(contains(@accept, 'image'))]"
-                try:
-                    upload_input = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
-                except TimeoutException:
-                    raise TimeoutException("Upload input element not found.")
+                raise TimeoutException("Upload input element not found.")
 
             # Send the file path to the hidden input element
             upload_input.send_keys(file_path)
@@ -364,6 +424,65 @@ class WhatsAppAutomation:
             logger.error(f"An unexpected error occurred while attaching file {file_path}: {e}")
         return False
 
+    def _find_upload_input(self, is_image: bool, timeout: int = 10):
+        """Get the file input that sends the file as a photo (images) or a document (PDF).
+
+        WhatsApp Web creates the "Photos & videos" and "Document" inputs only when their
+        menu item is clicked, and the only image input present beforehand is the Sticker
+        one. So the menu item is clicked (with the OS file picker suppressed) and the
+        input it creates is used. A generic image input is never used: it is the Sticker one.
+        """
+        inputs = self.driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]')
+        logger.info("Attach menu upload inputs before choosing (accept): " + (", ".join(
+            repr(i.get_attribute("accept")) for i in inputs) or "none"))
+
+        if is_image:
+            element = self._capture_menu_input(PHOTOS_MENU_LABELS, timeout) or \
+                self._existing_input(lambda accept: "image" in accept and "video" in accept)
+            if element:
+                logger.info("Sending the image as a photo.")
+                return element
+            logger.warning("'Photos & videos' upload not found. Sending the image as a document file so it is not sent as a sticker.")
+
+        element = self._capture_menu_input(DOCUMENT_MENU_LABELS, timeout) or \
+            self._existing_input(lambda accept: accept.strip() == "*")
+        if element and not is_image:
+            logger.info("Sending the file as a document.")
+        return element
+
+    def _existing_input(self, accept_matches):
+        for element in self.driver.find_elements(By.CSS_SELECTOR, 'input[type="file"]'):
+            if accept_matches((element.get_attribute("accept") or "").lower()):
+                return element
+        return None
+
+    def _capture_menu_input(self, labels, timeout: int):
+        """Click an attach-menu item and return the file input it opens, without the OS picker."""
+        label_test = " or ".join(f"normalize-space(text())={_xpath_literal(l)}" for l in labels)
+        items = [i for i in self.driver.find_elements(By.XPATH, f"//*[{label_test}]") if i.is_displayed()]
+        if not items:
+            logger.warning(f"Attach menu item '{labels[0]}' not found.")
+            return None
+
+        self.driver.execute_script(CAPTURE_FILE_INPUT_JS)
+        try:
+            try:
+                items[0].click()
+            except ElementClickInterceptedException:
+                self.driver.execute_script("arguments[0].click();", items[0])
+
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                element = self.driver.execute_script("return window.__wsCapturedInput;")
+                if element:
+                    logger.info(f"Captured the '{labels[0]}' upload input (accept={element.get_attribute('accept')!r}).")
+                    return element
+                time.sleep(0.25)
+            logger.warning(f"Clicking '{labels[0]}' did not open an upload input.")
+            return None
+        finally:
+            self.driver.execute_script(RESTORE_FILE_INPUT_JS)
+
     def _type_caption(self, caption: str):
         caption_selectors = [
             'div[aria-label="Add a caption"][contenteditable="true"]',
@@ -382,9 +501,14 @@ class WhatsAppAutomation:
             logger.warning("Caption box not found in the attachment preview. Sending the attachment without a caption.")
 
     def close_browser(self):
-        if self.driver:
+        # Safe to call twice (the run's cleanup and closing the app window can both call it)
+        driver, self.driver = self.driver, None
+        if driver:
             logger.info("Closing browser.")
-            self.driver.quit()
+            try:
+                driver.quit()
+            except Exception as e:
+                logger.warning(f"Browser did not close cleanly: {e}")
 
 # Main execution for testing WhatsApp automation directly
 if __name__ == '__main__':

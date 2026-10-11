@@ -13,7 +13,7 @@ from app.integrations.google_contacts import (
     get_label_member_count
 )
 from app.services.contact_service import validate_and_deduplicate_contacts
-from app.services.whatsapp_message_builder import build_registration_message, render_caption
+from app.services.whatsapp_message_builder import build_registration_message, render_custom_text
 from app.integrations.whatsapp_automation import WhatsAppAutomation
 
 # Modern Dark Theme Palette
@@ -32,6 +32,9 @@ ACCENT_RED = "#EF4444"
 ACCENT_CYAN = "#06B6D4"
 
 TERMINAL_BG = "#050810"
+
+# How long WhatsApp Web stays open after a run so sent messages can sync to the phone
+SYNC_WAIT_SECONDS = 5 * 60
 
 # Configure customtkinter aesthetics
 ctk.set_appearance_mode("Dark")
@@ -93,17 +96,24 @@ class TextboxLogHandler(logging.Handler):
             pass
 
 class CampaignDialog(ctk.CTkToplevel):
-    """Modal shown on START TASK to name the campaign and choose its attachment before it runs."""
+    """Modal shown on START TASK to name the campaign, pick its recipients and choose what to send."""
     NAME_MAX = 80
     DESCRIPTION_MAX = 250
+    MESSAGE_MAX = 4096
     # WhatsApp's own caption limit
     CAPTION_MAX = 1024
     ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".pdf")
+
+    MODE_LABEL = "Contact Label"
+    MODE_GROUP = "WhatsApp Group"
+    EMPTY_LABEL_ERROR = "This label has no contacts. Choose another label."
+    NO_LABEL_ERROR = "Load and select a contact label on the Dashboard first."
 
     def __init__(self, master, label_name, contact_count, on_confirm, default_attachment=""):
         super().__init__(master)
         self.on_confirm = on_confirm
         self.label_name = label_name
+        self.contact_count = contact_count
 
         self.title("New Campaign")
         self.configure(fg_color=BG_COLOR)
@@ -115,40 +125,77 @@ class CampaignDialog(ctk.CTkToplevel):
 
         title_lbl = ctk.CTkLabel(card, text="📢  New Campaign", font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"), text_color="#FFFFFF")
         title_lbl.pack(padx=24, pady=(22, 2), anchor="w")
-        desc_lbl = ctk.CTkLabel(card, text="Name this run and choose what to send with the message.", font=ctk.CTkFont(family="Segoe UI", size=12), text_color=TEXT_MUTED)
-        desc_lbl.pack(padx=24, pady=(0, 16), anchor="w")
+        desc_lbl = ctk.CTkLabel(card, text="Name this run, choose who receives it and what to send.", font=ctk.CTkFont(family="Segoe UI", size=12), text_color=TEXT_MUTED)
+        desc_lbl.pack(padx=24, pady=(0, 10), anchor="w")
 
-        # Selected label and its contact count
-        info_box = ctk.CTkFrame(card, fg_color="#101726", corner_radius=8)
-        info_box.pack(padx=24, pady=(0, 16), fill="x")
+        # Scrollable form so the window fits on small screens in either mode
+        form = ctk.CTkScrollableFrame(card, fg_color="transparent", width=470, height=470)
+        form.pack(padx=(14, 6), pady=(0, 4), fill="both", expand=True)
+        self.form = form
+
+        # Recipients: contacts from a Google label, or existing WhatsApp groups
+        ctk.CTkLabel(form, text="Send To", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(padx=10, pady=(0, 4), anchor="w")
+        self.mode_selector = ctk.CTkSegmentedButton(
+            form, values=[self.MODE_LABEL, self.MODE_GROUP], height=34,
+            selected_color=ACCENT_GREEN, selected_hover_color="#0D9488",
+            unselected_color=INPUT_BG, unselected_hover_color="#1E293B",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), command=self._set_mode
+        )
+        self.mode_selector.pack(padx=10, pady=(0, 12), fill="x")
+
+        self.mode_container = ctk.CTkFrame(form, fg_color="transparent")
+        self.mode_container.pack(padx=10, pady=(0, 4), fill="x")
+
+        # Contact label mode: selected label and its contact count
+        self.label_frame = ctk.CTkFrame(self.mode_container, fg_color="transparent")
+        info_box = ctk.CTkFrame(self.label_frame, fg_color="#101726", corner_radius=8)
+        info_box.pack(pady=(0, 4), fill="x")
         info_box.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(info_box, text="CONTACT LABEL", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=TEXT_MUTED).grid(row=0, column=0, padx=15, pady=(12, 4), sticky="w")
-        ctk.CTkLabel(info_box, text=label_name, font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color=TEXT_PRIMARY).grid(row=0, column=1, padx=15, pady=(12, 4), sticky="e")
+        ctk.CTkLabel(info_box, text=label_name or "No label selected", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color=TEXT_PRIMARY if label_name else ACCENT_RED).grid(row=0, column=1, padx=15, pady=(12, 4), sticky="e")
         ctk.CTkLabel(info_box, text="CONTACTS", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=TEXT_MUTED).grid(row=1, column=0, padx=15, pady=(4, 12), sticky="w")
-        self.count_lbl = ctk.CTkLabel(info_box, text="", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"))
+        self.count_lbl = ctk.CTkLabel(info_box, text="—", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color=TEXT_MUTED)
         self.count_lbl.grid(row=1, column=1, padx=15, pady=(4, 12), sticky="e")
+        ctk.CTkLabel(self.label_frame, text="Each contact receives the registration message from the template.", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED).pack(pady=(0, 8), anchor="w")
+
+        # WhatsApp group mode: group names and the message to post
+        self.group_frame = ctk.CTkFrame(self.mode_container, fg_color="transparent")
+        ctk.CTkLabel(self.group_frame, text="Group Names", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(pady=(0, 4), anchor="w")
+        self.groups_input = ctk.CTkTextbox(self.group_frame, height=64, fg_color=INPUT_BG, border_color=INPUT_BORDER, border_width=2, text_color=TEXT_PRIMARY, wrap="none", font=ctk.CTkFont(family="Segoe UI", size=13))
+        self.groups_input.pack(pady=(0, 2), fill="x")
+        ctk.CTkLabel(self.group_frame, text="One per line, exactly as shown in WhatsApp. You must be a member.", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED).pack(pady=(0, 8), anchor="w")
+
+        message_header = ctk.CTkFrame(self.group_frame, fg_color="transparent")
+        message_header.pack(pady=(0, 4), fill="x")
+        ctk.CTkLabel(message_header, text="Message", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(side="left")
+        self.message_counter_lbl = ctk.CTkLabel(message_header, text=f"0 / {self.MESSAGE_MAX}", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
+        self.message_counter_lbl.pack(side="right")
+        self.message_input = ctk.CTkTextbox(self.group_frame, height=90, fg_color=INPUT_BG, border_color=INPUT_BORDER, border_width=2, text_color=TEXT_PRIMARY, wrap="word", font=ctk.CTkFont(family="Segoe UI", size=13))
+        self.message_input.pack(pady=(0, 2), fill="x")
+        self.message_input.bind("<KeyRelease>", lambda e: self._enforce_limit(self.message_input, self.MESSAGE_MAX, self.message_counter_lbl))
+        ctk.CTkLabel(self.group_frame, text="Required unless you attach a file. {{name}} is replaced by the group name.", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED).pack(pady=(0, 8), anchor="w")
 
         # Campaign name (required)
-        ctk.CTkLabel(card, text="Campaign Name", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(padx=24, pady=(0, 4), anchor="w")
-        self.name_input = ctk.CTkEntry(card, placeholder_text="e.g. Spring Semester Registration", height=38, fg_color=INPUT_BG, border_color=INPUT_BORDER, text_color=TEXT_PRIMARY)
-        self.name_input.pack(padx=24, pady=(0, 12), fill="x")
+        ctk.CTkLabel(form, text="Campaign Name", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(padx=10, pady=(0, 4), anchor="w")
+        self.name_input = ctk.CTkEntry(form, placeholder_text="e.g. Spring Semester Registration", height=38, fg_color=INPUT_BG, border_color=INPUT_BORDER, text_color=TEXT_PRIMARY)
+        self.name_input.pack(padx=10, pady=(0, 12), fill="x")
 
         # Short description (optional, length-limited)
-        desc_header = ctk.CTkFrame(card, fg_color="transparent")
-        desc_header.pack(padx=24, pady=(0, 4), fill="x")
+        desc_header = ctk.CTkFrame(form, fg_color="transparent")
+        desc_header.pack(padx=10, pady=(0, 4), fill="x")
         ctk.CTkLabel(desc_header, text="Short Description (optional)", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(side="left")
         self.desc_counter_lbl = ctk.CTkLabel(desc_header, text=f"0 / {self.DESCRIPTION_MAX}", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
         self.desc_counter_lbl.pack(side="right")
 
-        self.desc_input = ctk.CTkTextbox(card, height=60, fg_color=INPUT_BG, border_color=INPUT_BORDER, border_width=2, text_color=TEXT_PRIMARY, wrap="word", font=ctk.CTkFont(family="Segoe UI", size=13))
-        self.desc_input.pack(padx=24, pady=(0, 12), fill="x")
+        self.desc_input = ctk.CTkTextbox(form, height=60, fg_color=INPUT_BG, border_color=INPUT_BORDER, border_width=2, text_color=TEXT_PRIMARY, wrap="word", font=ctk.CTkFont(family="Segoe UI", size=13))
+        self.desc_input.pack(padx=10, pady=(0, 12), fill="x")
         self.desc_input.bind("<KeyRelease>", lambda e: self._enforce_limit(self.desc_input, self.DESCRIPTION_MAX, self.desc_counter_lbl))
 
         # Attachment (optional): image or PDF sent after the message
-        ctk.CTkLabel(card, text="Attachment (optional)", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(padx=24, pady=(0, 4), anchor="w")
-        attach_row = ctk.CTkFrame(card, fg_color="transparent")
-        attach_row.pack(padx=24, pady=(0, 2), fill="x")
+        ctk.CTkLabel(form, text="Attachment (optional)", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(padx=10, pady=(0, 4), anchor="w")
+        attach_row = ctk.CTkFrame(form, fg_color="transparent")
+        attach_row.pack(padx=10, pady=(0, 2), fill="x")
         attach_row.grid_columnconfigure(0, weight=1)
 
         self.attachment_input = ctk.CTkEntry(attach_row, placeholder_text="No file selected", height=38, fg_color=INPUT_BG, border_color=INPUT_BORDER, text_color=TEXT_PRIMARY)
@@ -167,20 +214,20 @@ class CampaignDialog(ctk.CTkToplevel):
         )
         clear_btn.grid(row=0, column=2)
 
-        ctk.CTkLabel(card, text="PNG, JPG, JPEG or PDF", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED).pack(padx=24, pady=(0, 8), anchor="w")
+        ctk.CTkLabel(form, text="PNG, JPG, JPEG or PDF", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED).pack(padx=10, pady=(0, 8), anchor="w")
 
         # Caption shown under the attachment
-        caption_header = ctk.CTkFrame(card, fg_color="transparent")
-        caption_header.pack(padx=24, pady=(0, 4), fill="x")
+        caption_header = ctk.CTkFrame(form, fg_color="transparent")
+        caption_header.pack(padx=10, pady=(0, 4), fill="x")
         ctk.CTkLabel(caption_header, text="Attachment Caption (optional)", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF").pack(side="left")
         self.caption_counter_lbl = ctk.CTkLabel(caption_header, text=f"0 / {self.CAPTION_MAX}", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
         self.caption_counter_lbl.pack(side="right")
 
-        self.caption_input = ctk.CTkTextbox(card, height=60, fg_color=INPUT_BG, border_color=INPUT_BORDER, border_width=2, text_color=TEXT_PRIMARY, wrap="word", font=ctk.CTkFont(family="Segoe UI", size=13))
-        self.caption_input.pack(padx=24, pady=(0, 2), fill="x")
+        self.caption_input = ctk.CTkTextbox(form, height=60, fg_color=INPUT_BG, border_color=INPUT_BORDER, border_width=2, text_color=TEXT_PRIMARY, wrap="word", font=ctk.CTkFont(family="Segoe UI", size=13))
+        self.caption_input.pack(padx=10, pady=(0, 2), fill="x")
         self.caption_input.bind("<KeyRelease>", lambda e: self._enforce_limit(self.caption_input, self.CAPTION_MAX, self.caption_counter_lbl))
-        self.caption_hint_lbl = ctk.CTkLabel(card, text="Use {{name}} to insert each contact's name.", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
-        self.caption_hint_lbl.pack(padx=24, pady=(0, 6), anchor="w")
+        self.caption_hint_lbl = ctk.CTkLabel(form, text="", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
+        self.caption_hint_lbl.pack(padx=10, pady=(0, 6), anchor="w")
 
         if default_attachment:
             self.attachment_input.insert(0, default_attachment)
@@ -206,7 +253,14 @@ class CampaignDialog(ctk.CTkToplevel):
         )
         self.confirm_btn.grid(row=0, column=1, padx=(6, 0), sticky="ew")
 
-        self.set_contact_count(contact_count, checking=True)
+        self.checking_count = bool(label_name)
+        if label_name:
+            self.set_contact_count(contact_count, checking=True)
+
+        # Without a loaded label, sending to groups is the only usable mode
+        initial_mode = self.MODE_LABEL if label_name else self.MODE_GROUP
+        self.mode_selector.set(initial_mode)
+        self._set_mode(initial_mode)
 
         self.name_input.bind("<Return>", lambda e: self._confirm())
         self.bind("<Escape>", lambda e: self.destroy())
@@ -218,23 +272,48 @@ class CampaignDialog(ctk.CTkToplevel):
         self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         self.after(100, self._make_modal)
 
-    EMPTY_LABEL_ERROR = "This label has no contacts. Choose another label."
+    @property
+    def mode(self):
+        return self.mode_selector.get()
+
+    def _set_mode(self, mode):
+        if mode == self.MODE_GROUP:
+            self.label_frame.pack_forget()
+            self.group_frame.pack(fill="x")
+            self.caption_hint_lbl.configure(text="Use {{name}} to insert the group name.")
+        else:
+            self.group_frame.pack_forget()
+            self.label_frame.pack(fill="x")
+            self.caption_hint_lbl.configure(text="Use {{name}} to insert each contact's name.")
+        self._refresh_confirm_state()
 
     def set_contact_count(self, contact_count, checking=False):
         """Show the label's contact count; checking=True marks it as cached while a fresh count loads."""
+        self.contact_count = contact_count
+        self.checking_count = checking
         text = f"{contact_count:,} contact{'' if contact_count == 1 else 's'}"
         if checking:
             text += "  (checking...)"
         self.count_lbl.configure(text=text, text_color=ACCENT_GREEN if contact_count else ACCENT_RED)
+        self._refresh_confirm_state()
 
-        if contact_count:
-            # Only clear the empty-label error, not a validation error the user is looking at
-            if self.error_lbl.cget("text") == self.EMPTY_LABEL_ERROR:
+    def _refresh_confirm_state(self):
+        # Only manage the label-related errors here, not a validation error the user is looking at
+        label_errors = (self.EMPTY_LABEL_ERROR, self.NO_LABEL_ERROR)
+        label_error = None
+        if self.mode == self.MODE_LABEL:
+            if not self.label_name:
+                label_error = self.NO_LABEL_ERROR
+            elif not self.contact_count:
+                label_error = self.EMPTY_LABEL_ERROR
+
+        if label_error:
+            self.error_lbl.configure(text=label_error)
+            self.confirm_btn.configure(state="disabled")
+        else:
+            if self.error_lbl.cget("text") in label_errors:
                 self.error_lbl.configure(text="")
             self.confirm_btn.configure(state="normal")
-        else:
-            self.error_lbl.configure(text=self.EMPTY_LABEL_ERROR)
-            self.confirm_btn.configure(state="disabled")
 
     def _make_modal(self):
         try:
@@ -299,8 +378,33 @@ class CampaignDialog(ctk.CTkToplevel):
             self._enforce_limit(self.caption_input, self.CAPTION_MAX, self.caption_counter_lbl)
             caption = self.caption_input.get("1.0", "end-1c").strip()
 
+        campaign = {
+            "name": name,
+            "description": description,
+            "attachment_path": attachment or None,
+            "caption": caption,
+        }
+
+        if self.mode == self.MODE_GROUP:
+            groups = []
+            for line in self.groups_input.get("1.0", "end-1c").splitlines():
+                group_name = line.strip()
+                if group_name and group_name not in groups:
+                    groups.append(group_name)
+            if not groups:
+                self.error_lbl.configure(text="Enter at least one WhatsApp group name.")
+                return
+            self._enforce_limit(self.message_input, self.MESSAGE_MAX, self.message_counter_lbl)
+            message = self.message_input.get("1.0", "end-1c").strip()
+            if not message and not attachment:
+                self.error_lbl.configure(text="Enter a message or choose an attachment.")
+                return
+            campaign.update(mode="group", groups=groups, message=message)
+        else:
+            campaign.update(mode="label", label_name=self.label_name)
+
         self.destroy()
-        self.on_confirm(self.label_name, name, description, attachment or None, caption)
+        self.on_confirm(campaign)
 
 
 class App(ctk.CTk):
@@ -318,6 +422,8 @@ class App(ctk.CTk):
         self.running_thread = None
         self.is_paused = False
         self.is_stopped = False
+        self.sync_waiting = False
+        self.skip_sync_wait = False
         self.start_time = None
         self.elapsed_seconds = 0
         self.sent_count = 0
@@ -1458,7 +1564,7 @@ class App(ctk.CTk):
     # Pause / Resume / Stop Actions
     # ----------------------------------------------------
     def toggle_pause(self):
-        if not self.running_thread or not self.running_thread.is_alive():
+        if not self.running_thread or not self.running_thread.is_alive() or self.sync_waiting:
             return
         self.is_paused = not self.is_paused
         if self.is_paused:
@@ -1474,6 +1580,11 @@ class App(ctk.CTk):
 
     def stop_automation_run(self):
         if not self.running_thread or not self.running_thread.is_alive():
+            return
+        if self.sync_waiting:
+            # Sending is already done; STOP now only cuts the phone sync wait short
+            self.skip_sync_wait = True
+            self.textbox_log("SYSTEM: WARN: Closing WhatsApp early. Recently sent messages may not appear on the phone yet.")
             return
         self.is_stopped = True
         self.textbox_log("SYSTEM: Stop command received. Halting automation sequence...")
@@ -1502,26 +1613,24 @@ class App(ctk.CTk):
     # Start automation process
     # ----------------------------------------------------
     def start_automation(self):
-        selected_label = self.label_dropdown.get()
-        if selected_label == "Click 'Refresh Google Contacts'" or not selected_label:
-            self.textbox_log("SYSTEM: Error - Please select a valid Google Contact label first.")
-            return
         if self.running_thread and self.running_thread.is_alive():
             return
 
+        # A label is only needed for the contact-label mode; groups can be sent without one
+        selected_label = self.label_dropdown.get()
         group = self._find_label(selected_label)
+        label_name = selected_label if group else None
         contact_count = group.get('memberCount', 0) if group else 0
+
         # Pre-fill the attachment with the flyer from Settings, if it exists and is a supported type
         default_attachment = settings.RESOLVED_FLYER_PATH
         if not (os.path.isfile(default_attachment) and default_attachment.lower().endswith(CampaignDialog.ATTACHMENT_EXTENSIONS)):
             default_attachment = ""
-        dialog = CampaignDialog(self, selected_label, contact_count, on_confirm=self._launch_campaign, default_attachment=default_attachment)
+        dialog = CampaignDialog(self, label_name, contact_count, on_confirm=self._launch_campaign, default_attachment=default_attachment)
 
         # The cached count dates from the last label refresh, so re-check it with Google
         if group and group.get('resourceName'):
             threading.Thread(target=self._refresh_label_count_worker, args=(group, dialog), daemon=True).start()
-        else:
-            dialog.set_contact_count(contact_count)
 
     def _refresh_label_count_worker(self, group, dialog):
         try:
@@ -1540,12 +1649,16 @@ class App(ctk.CTk):
         if dialog.winfo_exists():
             dialog.set_contact_count(count)
 
-    def _launch_campaign(self, selected_label, campaign_name, campaign_description, attachment_path, caption):
-        self.textbox_log(f"SYSTEM: Campaign '{campaign_name}' started on label '{selected_label}'.")
-        if campaign_description:
-            self.textbox_log(f"SYSTEM: Campaign description: {campaign_description}")
-        if attachment_path:
-            self.textbox_log(f"SYSTEM: Attachment: {os.path.basename(attachment_path)}" + (" (with caption)" if caption else ""))
+    def _launch_campaign(self, campaign):
+        if campaign["mode"] == "group":
+            target_text = f"{len(campaign['groups'])} WhatsApp group(s): {', '.join(campaign['groups'])}"
+        else:
+            target_text = f"label '{campaign['label_name']}'"
+        self.textbox_log(f"SYSTEM: Campaign '{campaign['name']}' started on {target_text}.")
+        if campaign["description"]:
+            self.textbox_log(f"SYSTEM: Campaign description: {campaign['description']}")
+        if campaign["attachment_path"]:
+            self.textbox_log(f"SYSTEM: Attachment: {os.path.basename(campaign['attachment_path'])}" + (" (with caption)" if campaign["caption"] else ""))
         else:
             self.textbox_log("SYSTEM: No attachment. Sending text messages only.")
 
@@ -1560,90 +1673,105 @@ class App(ctk.CTk):
         self.elapsed_val_lbl.configure(text="00:00:00")
         self.avg_speed_val_lbl.configure(text="0.0 msg/s")
         self.failures_val_lbl.configure(text="0")
-        
+
         self.is_paused = False
         self.is_stopped = False
+        self.sync_waiting = False
+        self.skip_sync_wait = False
         self.elapsed_seconds = 0
         self.sent_count = 0
         self.failures_count = 0
         self.total_contacts_count = 0
 
-        self.seq_name_lbl.configure(text=f"Active Campaign: '{campaign_name}'")
+        self.seq_name_lbl.configure(text=f"Active Campaign: '{campaign['name']}'")
         self.running_badge_lbl.configure(text="●  RUNNING", text_color="#3B82F6")
         self.running_badge.configure(fg_color="#1A2D42")
 
         # Spawn dispatcher thread
         self.running_thread = threading.Thread(
             target=self._automation_worker,
-            args=(selected_label, attachment_path, caption),
+            args=(campaign,),
             daemon=True
         )
         self.running_thread.start()
-        
+
         # Start timer updates
         self.after(1000, self.update_timer)
 
-    def _automation_worker(self, label_name, attachment_path=None, caption=""):
+    def _build_label_targets(self, label_name, caption):
+        """Fetch, validate and dedupe the label's contacts; returns send targets or None to abort."""
+        selected_group = self._find_label(label_name)
+        if not selected_group:
+            logger.error("SYSTEM: Selected contact label could not be found.")
+            return None
+
+        resource_name = selected_group.get('resourceName')
+        logger.info(f"SYSTEM: Target Resource Path: {resource_name}")
+
+        self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text=f"Fetching contacts from '{label_name}'..."))
+        raw_contacts = get_contacts_from_label(get_people_service(), resource_name)
+        if not raw_contacts:
+            logger.warning(f"SYNC: No contacts found under label: {label_name}")
+            self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Completed (Empty Label)"))
+            return None
+
+        self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Processing contact details..."))
+        processed_contacts = validate_and_deduplicate_contacts(raw_contacts)
+        if not processed_contacts:
+            logger.warning("SYNC: No valid or unique phone numbers found after processing.")
+            self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Completed (No valid numbers)"))
+            return None
+
+        logger.info(f"SYNC: Successfully fetched {len(processed_contacts)} contacts from Google API")
+        count = len(processed_contacts)
+        self.label_count_val.after(0, lambda: self.label_count_val.configure(text=f"{count} Contacts"))
+        self.contacts_val_lbl.after(0, lambda: self.contacts_val_lbl.configure(text=f"{count:,}"))
+
+        return [{
+            "kind": "phone",
+            "to": contact['phone'],
+            "display": f"{contact['name']} ({contact['phone']})",
+            "message": build_registration_message(contact['name']),
+            "caption": render_custom_text(caption, contact['name']) if caption else None,
+        } for contact in processed_contacts]
+
+    def _build_group_targets(self, groups, message, caption):
+        return [{
+            "kind": "group",
+            "to": group_name,
+            "display": f"group '{group_name}'",
+            "message": render_custom_text(message, group_name) if message else "",
+            "caption": render_custom_text(caption, group_name) if caption else None,
+        } for group_name in groups]
+
+    def _automation_worker(self, campaign):
         try:
             logger.info("SYSTEM: Initializing automation sequence...")
-            
-            # Step 1: Find match for label resource name
-            selected_group = None
-            for group in self.labels_list:
-                name = group.get('formattedName', group.get('name', 'Unnamed Label'))
-                if name == label_name:
-                    selected_group = group
-                    break
+            attachment_path = campaign["attachment_path"]
 
-            if not selected_group:
-                logger.error("SYSTEM: Selected contact label could not be found.")
-                self.cleanup_console_idle()
+            # Steps 1-3: Work out who receives the campaign
+            if campaign["mode"] == "group":
+                targets = self._build_group_targets(campaign["groups"], campaign["message"], campaign["caption"])
+            else:
+                targets = self._build_label_targets(campaign["label_name"], campaign["caption"])
+            if not targets:
                 return
 
-            resource_name = selected_group.get('resourceName')
-            logger.info(f"SYSTEM: Target Resource Path: {resource_name}")
-
-            # Step 2: Fetch contacts
-            self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text=f"Fetching contacts from '{label_name}'..."))
-            people_service = get_people_service()
-            raw_contacts = get_contacts_from_label(people_service, resource_name)
-            
-            if not raw_contacts:
-                logger.warning(f"SYNC: No contacts found under label: {label_name}")
-                self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Completed (Empty Label)"))
-                self.cleanup_console_idle()
-                return
-
-            # Step 3: Validate and Deduplicate
-            self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Processing contact details..."))
-            processed_contacts = validate_and_deduplicate_contacts(raw_contacts)
-            
-            if not processed_contacts:
-                logger.warning("SYNC: No valid or unique phone numbers found after processing.")
-                self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Completed (No valid numbers)"))
-                self.cleanup_console_idle()
-                return
-
-            self.total_contacts_count = len(processed_contacts)
-            logger.info(f"SYNC: Successfully fetched {self.total_contacts_count} contacts from Google API")
-            
-            # Update metrics cards label count
-            self.label_count_val.after(0, lambda: self.label_count_val.configure(text=f"{self.total_contacts_count} Contacts"))
-            self.contacts_val_lbl.after(0, lambda: self.contacts_val_lbl.configure(text=f"{self.total_contacts_count:,}"))
+            self.total_contacts_count = len(targets)
 
             # Step 4: WhatsApp automation login
             self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Launching WhatsApp Automation Browser..."))
             wa_automation = WhatsAppAutomation()
-            
+
             try:
                 wa_automation.launch_browser()
                 logger.info("SUCCESS: WhatsApp Web socket connection established")
                 self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Waiting for WhatsApp Web login..."))
-                
+
                 # Check login or await manual QR scans
                 if not wa_automation.wait_for_login():
                     self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Action Required (Scan QR Code)"))
-                    
+
                     logged_in = False
                     for attempt in range(24): # Await up to 120s
                         # Check for Stop/Pause during QR wait
@@ -1659,20 +1787,18 @@ class App(ctk.CTk):
                         if wa_automation.wait_for_login():
                             logged_in = True
                             break
-                    
+
                     if self.is_stopped:
                         logger.info("SYSTEM: Login cancelled by user stop.")
-                        self.cleanup_console_idle()
                         return
 
                     if not logged_in:
                         logger.error("SYSTEM: Authentication check timed out. User was not logged into WhatsApp Web.")
                         self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Timeout Login"))
-                        self.cleanup_console_idle()
                         return
 
                 self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Logged In. Preparing to dispatch..."))
-                
+
                 if attachment_path and not os.path.exists(attachment_path):
                     logger.warning(f"SYSTEM: Attachment not found at '{attachment_path}'. Sending messages without attachment.")
                     attachment_path = None
@@ -1680,7 +1806,7 @@ class App(ctk.CTk):
                     logger.info(f"DEBUG: Loading attachment '{os.path.basename(attachment_path)}' ({os.path.getsize(attachment_path)/(1024*1024):.1f}MB)")
 
                 # Step 5: Send Messages loop
-                for i, contact in enumerate(processed_contacts):
+                for i, target in enumerate(targets):
                     # Check for Stop/Pause
                     if self.is_stopped:
                         logger.info("SYSTEM: Automation stopped by user.")
@@ -1693,32 +1819,35 @@ class App(ctk.CTk):
                         logger.info("SYSTEM: Automation stopped by user.")
                         break
 
-                    student_name = contact['name']
-                    student_phone = contact['phone']
-                    message = build_registration_message(student_name)
+                    display = target["display"]
 
                     # Update dispatch status
-                    self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(
-                        text=f"Currently messaging: {student_name} ({student_phone})..."
+                    self.live_status_lbl.after(0, lambda d=display: self.live_status_lbl.configure(
+                        text=f"Currently messaging: {d}..."
                     ))
-                    
+
                     progress_pct = (i + 1) / self.total_contacts_count
                     self.progress_bar.after(0, lambda p=progress_pct: self.progress_bar.set(p))
                     self.prog_percent_lbl.after(0, lambda p=int(progress_pct*100): self.prog_percent_lbl.configure(text=f"{p}%"))
                     self.prog_count_lbl.after(0, lambda count=i+1, total=self.total_contacts_count: self.prog_count_lbl.configure(text=f"{count} / {total} Processed"))
 
-                    logger.info(f"TASK: Sending message to {student_name} ({student_phone})")
-                    success = wa_automation.send_message(
-                        student_phone, message,
-                        attachment_path=attachment_path,
-                        caption=render_caption(caption, student_name) if caption else None
-                    )
-                    
+                    logger.info(f"TASK: Sending message to {display}")
+                    if target["kind"] == "group":
+                        success = wa_automation.send_to_group(
+                            target["to"], target["message"],
+                            attachment_path=attachment_path, caption=target["caption"]
+                        )
+                    else:
+                        success = wa_automation.send_message(
+                            target["to"], target["message"],
+                            attachment_path=attachment_path, caption=target["caption"]
+                        )
+
                     if success:
                         self.sent_count += 1
                         self.messages_val_lbl.after(0, lambda: self.messages_val_lbl.configure(text=f"{self.sent_count:,}"))
                     else:
-                        logger.error(f"SYSTEM: Failed to dispatch message to {student_name} ({student_phone}).")
+                        logger.error(f"SYSTEM: Failed to dispatch message to {display}.")
                         self.failures_count += 1
                         self.failures_val_lbl.after(0, lambda: self.failures_val_lbl.configure(text=str(self.failures_count)))
 
@@ -1728,10 +1857,14 @@ class App(ctk.CTk):
                         rate = (self.sent_count / total_attempted) * 100
                         self.success_val_lbl.after(0, lambda r=rate: self.success_val_lbl.configure(text=f"{r:.1f}%"))
 
+                    # No cooldown needed after the last recipient
+                    if i == len(targets) - 1:
+                        break
+
                     # Wait cooling delay
                     delay_seconds = 5
                     logger.info(f"SYSTEM: Cooling down for {delay_seconds} seconds to comply with anti-spam rate limits...")
-                    
+
                     # Responsive sleep interval
                     for _ in range(delay_seconds * 2):
                         if self.is_stopped:
@@ -1745,8 +1878,14 @@ class App(ctk.CTk):
                 if self.is_stopped:
                     self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Status: Stopped by User", text_color=ACCENT_RED))
                 else:
-                    logger.info("SYSTEM: All student invitations have been processed successfully.")
-                    self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Status: All Messages Dispatched", text_color=ACCENT_GREEN))
+                    logger.info("SYSTEM: All messages have been processed.")
+                    if not self.failures_count:
+                        status, color = "Status: All Messages Dispatched", ACCENT_GREEN
+                    elif self.sent_count:
+                        status, color = f"Status: Finished. {self.sent_count} sent, {self.failures_count} failed (see log)", "#F59E0B"
+                    else:
+                        status, color = "Status: Finished. All sends failed (see log)", ACCENT_RED
+                    self.live_status_lbl.after(0, lambda s=status, c=color: self.live_status_lbl.configure(text=s, text_color=c))
                     self.progress_bar.after(0, lambda: self.progress_bar.set(1.0))
                     self.prog_percent_lbl.after(0, lambda: self.prog_percent_lbl.configure(text="100%"))
 
@@ -1754,6 +1893,10 @@ class App(ctk.CTk):
                 logger.error(f"SYSTEM: Error during browser automation processing: {e}")
                 self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Error during sending", text_color=ACCENT_RED))
             finally:
+                # Anything sent (even by a run that was stopped or failed part-way) needs time
+                # to sync from WhatsApp Web to the phone before the browser closes
+                if wa_automation.sends_clicked > 0:
+                    self._wait_for_phone_sync()
                 logger.info("SYSTEM: Shutting down browser backend.")
                 wa_automation.close_browser()
 
@@ -1762,6 +1905,32 @@ class App(ctk.CTk):
             self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Critical Error", text_color=ACCENT_RED))
         finally:
             self.cleanup_console_idle()
+
+    def _wait_for_phone_sync(self):
+        self.sync_waiting = True
+        self.skip_sync_wait = False
+        minutes = SYNC_WAIT_SECONDS // 60
+        logger.info(f"SYSTEM: Keeping WhatsApp Web open for {minutes} minutes so messages sync to the phone. Press STOP to close sooner.")
+        self.running_badge_lbl.after(0, lambda: self.running_badge_lbl.configure(text="●  SYNCING", text_color=ACCENT_CYAN))
+        try:
+            remaining = SYNC_WAIT_SECONDS
+            while remaining > 0 and not self.skip_sync_wait:
+                left = f"{remaining // 60}:{remaining % 60:02d}"
+                self.live_status_lbl.after(0, lambda l=left: self.live_status_lbl.configure(
+                    text=f"Syncing with phone... closing WhatsApp in {l} (STOP closes now)", text_color=ACCENT_CYAN
+                ))
+                time.sleep(1)
+                remaining -= 1
+            summary = f"{self.sent_count} sent, {self.failures_count} failed"
+            color = ACCENT_GREEN if not self.failures_count and not self.skip_sync_wait else "#F59E0B"
+            if not self.skip_sync_wait:
+                logger.info("SYSTEM: Phone sync wait finished.")
+                status = f"Status: Done ({summary}). WhatsApp closed after sync wait."
+            else:
+                status = f"Status: Done ({summary}). WhatsApp closed early."
+            self.live_status_lbl.after(0, lambda s=status, c=color: self.live_status_lbl.configure(text=s, text_color=c))
+        finally:
+            self.sync_waiting = False
 
     def cleanup_console_idle(self):
         self.start_btn.after(0, lambda: self.start_btn.configure(state="normal"))

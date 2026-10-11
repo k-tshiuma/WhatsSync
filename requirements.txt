@@ -11,3 +11,4 @@ webdriver_manager
 jinja2
 customtkinter
 pyinstaller
+psutil

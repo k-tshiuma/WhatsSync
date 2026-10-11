@@ -102,14 +102,14 @@ class CampaignDialog(ctk.CTkToplevel):
     MESSAGE_MAX = 4096
     # WhatsApp's own caption limit
     CAPTION_MAX = 1024
-    ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".pdf")
+    ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".pdf", ".docx")
 
     MODE_LABEL = "Contact Label"
     MODE_GROUP = "WhatsApp Group"
     EMPTY_LABEL_ERROR = "This label has no contacts. Choose another label."
     NO_LABEL_ERROR = "Load and select a contact label on the Dashboard first."
 
-    def __init__(self, master, label_name, contact_count, on_confirm, default_attachment=""):
+    def __init__(self, master, label_name, contact_count, on_confirm):
         super().__init__(master)
         self.on_confirm = on_confirm
         self.label_name = label_name
@@ -214,7 +214,7 @@ class CampaignDialog(ctk.CTkToplevel):
         )
         clear_btn.grid(row=0, column=2)
 
-        ctk.CTkLabel(form, text="PNG, JPG, JPEG or PDF", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED).pack(padx=10, pady=(0, 8), anchor="w")
+        ctk.CTkLabel(form, text="PNG, JPG, JPEG, PDF or DOCX. Nothing is attached unless you choose a file.", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED).pack(padx=10, pady=(0, 8), anchor="w")
 
         # Caption shown under the attachment
         caption_header = ctk.CTkFrame(form, fg_color="transparent")
@@ -229,8 +229,6 @@ class CampaignDialog(ctk.CTkToplevel):
         self.caption_hint_lbl = ctk.CTkLabel(form, text="", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
         self.caption_hint_lbl.pack(padx=10, pady=(0, 6), anchor="w")
 
-        if default_attachment:
-            self.attachment_input.insert(0, default_attachment)
         self._update_caption_state()
 
         self.error_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=ACCENT_RED)
@@ -334,7 +332,7 @@ class CampaignDialog(ctk.CTkToplevel):
         filename = filedialog.askopenfilename(
             parent=self,
             title="Select Attachment",
-            filetypes=[("Images and PDF", "*.png *.jpg *.jpeg *.pdf"), ("Images", "*.png *.jpg *.jpeg"), ("PDF", "*.pdf")]
+            filetypes=[("Images and documents", "*.png *.jpg *.jpeg *.pdf *.docx"), ("Images", "*.png *.jpg *.jpeg"), ("PDF", "*.pdf"), ("Word document", "*.docx")]
         )
         if filename:
             self.attachment_input.delete(0, "end")
@@ -370,7 +368,7 @@ class CampaignDialog(ctk.CTkToplevel):
         if attachment:
             attachment = os.path.abspath(attachment)
             if not attachment.lower().endswith(self.ATTACHMENT_EXTENSIONS):
-                self.error_lbl.configure(text="Attachment must be a PNG, JPG, JPEG or PDF file.")
+                self.error_lbl.configure(text="Attachment must be a PNG, JPG, JPEG, PDF or DOCX file.")
                 return
             if not os.path.isfile(attachment):
                 self.error_lbl.configure(text="Attachment file not found.")
@@ -444,6 +442,11 @@ class App(ctk.CTk):
 
         # Load Google Contact labels on start
         self.load_labels_async()
+
+        # Closing the window mid-run must not leave the WhatsApp browser running: it would
+        # hold the Chrome profile and make the next run fail to start
+        self.active_wa = None
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ----------------------------------------------------
     # Sidebar Navigation Creation
@@ -1622,11 +1625,8 @@ class App(ctk.CTk):
         label_name = selected_label if group else None
         contact_count = group.get('memberCount', 0) if group else 0
 
-        # Pre-fill the attachment with the flyer from Settings, if it exists and is a supported type
-        default_attachment = settings.RESOLVED_FLYER_PATH
-        if not (os.path.isfile(default_attachment) and default_attachment.lower().endswith(CampaignDialog.ATTACHMENT_EXTENSIONS)):
-            default_attachment = ""
-        dialog = CampaignDialog(self, label_name, contact_count, on_confirm=self._launch_campaign, default_attachment=default_attachment)
+        # No attachment by default: the user picks one in the dialog if they want one
+        dialog = CampaignDialog(self, label_name, contact_count, on_confirm=self._launch_campaign)
 
         # The cached count dates from the last label refresh, so re-check it with Google
         if group and group.get('resourceName'):
@@ -1762,6 +1762,7 @@ class App(ctk.CTk):
             # Step 4: WhatsApp automation login
             self.live_status_lbl.after(0, lambda: self.live_status_lbl.configure(text="Launching WhatsApp Automation Browser..."))
             wa_automation = WhatsAppAutomation()
+            self.active_wa = wa_automation
 
             try:
                 wa_automation.launch_browser()
@@ -1899,6 +1900,7 @@ class App(ctk.CTk):
                     self._wait_for_phone_sync()
                 logger.info("SYSTEM: Shutting down browser backend.")
                 wa_automation.close_browser()
+                self.active_wa = None
 
         except Exception as e:
             logger.error(f"SYSTEM: Critical execution error: {e}")
@@ -1931,6 +1933,16 @@ class App(ctk.CTk):
             self.live_status_lbl.after(0, lambda s=status, c=color: self.live_status_lbl.configure(text=s, text_color=c))
         finally:
             self.sync_waiting = False
+
+    def on_close(self):
+        wa = self.active_wa
+        if wa:
+            if self.sync_waiting:
+                logger.warning("SYSTEM: App closed during the phone sync wait. Recently sent messages may not appear on the phone yet.")
+            self.is_stopped = True
+            self.skip_sync_wait = True
+            wa.close_browser()
+        self.destroy()
 
     def cleanup_console_idle(self):
         self.start_btn.after(0, lambda: self.start_btn.configure(state="normal"))

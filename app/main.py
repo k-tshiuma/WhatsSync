@@ -76,7 +76,7 @@ def main():
                 logger.error("User did not log in to WhatsApp Web. Exiting automation.")
                 return
 
-        flyer_to_attach = os.path.abspath(settings.FLYER_PATH)
+        flyer_to_attach = os.path.abspath(settings.RESOLVED_FLYER_PATH)
         if not os.path.exists(flyer_to_attach):
             logger.warning(f"Flyer file not found at '{flyer_to_attach}'. Messages will be sent without an attachment.")
             flyer_to_attach = None

@@ -6,7 +6,12 @@ from googleapiclient.discovery import build
 from app.config.settings import settings
 from app.utils.logger import logger
 
-SCOPES = ['https://www.googleapis.com/auth/contacts.readonly']
+SCOPES = [
+    'https://www.googleapis.com/auth/contacts.readonly',
+    # Lets the Settings page show which account is signed in
+    'openid',
+    'https://www.googleapis.com/auth/userinfo.email'
+]
 TOKEN_PICKLE_FILE = os.path.abspath(os.path.join(settings.BASE_PATH, 'data/token.pickle'))
 CLIENT_SECRETS_FILE = os.path.abspath(os.path.join(settings.BASE_PATH, 'client_secrets.json'))
 
@@ -15,6 +20,10 @@ def get_google_credentials():
     if os.path.exists(TOKEN_PICKLE_FILE):
         with open(TOKEN_PICKLE_FILE, 'rb') as token:
             creds = pickle.load(token)
+        # A token from before a scope was added can't be refreshed into it, so sign in again
+        if creds and not creds.has_scopes(SCOPES):
+            logger.info("Cached Google token is missing required permissions. Signing in again...")
+            creds = None
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -35,6 +44,32 @@ def get_google_credentials():
         with open(TOKEN_PICKLE_FILE, 'wb') as token:
             pickle.dump(creds, token)
     return creds
+
+def load_cached_credentials():
+    """Return the saved credentials without ever opening the browser sign-in, or None."""
+    if not os.path.exists(TOKEN_PICKLE_FILE):
+        return None
+    with open(TOKEN_PICKLE_FILE, 'rb') as token:
+        creds = pickle.load(token)
+    if creds and not creds.valid and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return creds if creds and creds.valid else None
+
+def get_account_email(creds):
+    """Return the signed-in account's email, or None if the token lacks the email scope."""
+    if not creds.has_scopes(['https://www.googleapis.com/auth/userinfo.email']):
+        return None
+    service = build('oauth2', 'v2', credentials=creds)
+    return service.userinfo().get().execute().get('email')
+
+def sign_out():
+    """Forget the cached Google token so the next sync asks the user to sign in."""
+    if os.path.exists(TOKEN_PICKLE_FILE):
+        os.remove(TOKEN_PICKLE_FILE)
+        logger.info("Removed cached Google token.")
+
+def client_secrets_present():
+    return os.path.exists(CLIENT_SECRETS_FILE)
 
 def get_people_service():
     creds = get_google_credentials()

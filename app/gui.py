@@ -7,7 +7,10 @@ import customtkinter as ctk
 from tkinter import filedialog
 from app.config.settings import settings
 from app.utils.logger import logger
-from app.integrations.google_contacts import get_people_service, list_contact_labels, get_contacts_from_label
+from app.integrations.google_contacts import (
+    get_people_service, list_contact_labels, get_contacts_from_label,
+    load_cached_credentials, get_account_email, sign_out, client_secrets_present
+)
 from app.services.contact_service import validate_and_deduplicate_contacts
 from app.services.whatsapp_message_builder import build_registration_message
 from app.integrations.whatsapp_automation import WhatsAppAutomation
@@ -33,6 +36,39 @@ TERMINAL_BG = "#050810"
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+LOG_TAG_COLORS = {
+    "INFO": "#10B981",     # Green
+    "SUCCESS": "#34D399",  # Bright green
+    "SYNC": "#60A5FA",     # Blue
+    "SYSTEM": "#22D3EE",   # Cyan
+    "TASK": "#E5E7EB",     # White
+    "WARNING": "#F59E0B",  # Yellow
+    "ERROR": "#EF4444",    # Red
+    "DEBUG": "#9CA3AF"     # Muted gray
+}
+
+def configure_log_tags(textbox):
+    for tag, color in LOG_TAG_COLORS.items():
+        textbox.tag_config(tag, foreground=color)
+
+def classify_log_line(msg, levelname=""):
+    """Map a log line to a terminal styling tag by its prefix keyword or level."""
+    if "SUCCESS" in msg:
+        return "SUCCESS"
+    elif "SYNC" in msg:
+        return "SYNC"
+    elif "SYSTEM" in msg:
+        return "SYSTEM"
+    elif "TASK" in msg:
+        return "TASK"
+    elif "WARN" in msg:
+        return "WARNING"
+    elif "ERROR" in msg or "CRITICAL" in msg:
+        return "ERROR"
+    elif levelname == "DEBUG" or "DEBUG:" in msg:
+        return "DEBUG"
+    return "INFO"
+
 class TextboxLogHandler(logging.Handler):
     """Custom logging handler to stream records into a CustomTkinter Textbox safely from any thread."""
     def __init__(self, textbox):
@@ -48,23 +84,7 @@ class TextboxLogHandler(logging.Handler):
         try:
             self.textbox.configure(state="normal")
             
-            # Map log levels / content keywords to terminal styling tags
-            tag = "INFO"
-            if "SUCCESS:" in msg or "SUCCESS" in msg:
-                tag = "SUCCESS"
-            elif "SYNC:" in msg or "SYNC" in msg:
-                tag = "SYNC"
-            elif "SYSTEM:" in msg or "SYSTEM" in msg:
-                tag = "SYSTEM"
-            elif "TASK:" in msg or "TASK" in msg:
-                tag = "TASK"
-            elif "WARN:" in msg or "WARN" in msg or "WARNING" in msg:
-                tag = "WARNING"
-            elif "ERROR" in msg or "CRITICAL" in msg:
-                tag = "ERROR"
-            elif levelname == "DEBUG" or "DEBUG:" in msg:
-                tag = "DEBUG"
-            
+            tag = classify_log_line(msg, levelname)
             self.textbox.insert("end", msg + "\n", tag)
             self.textbox.configure(state="disabled")
             self.textbox.see("end")
@@ -148,14 +168,13 @@ class App(ctk.CTk):
         )
         logo_subtitle.grid(row=1, column=1, sticky="w")
 
-        # Sidebar Buttons (Dashboard, Google Sync, Automations, Campaigns, History)
+        # Sidebar Buttons (Dashboard, Campaigns, History, Logs)
         self.sidebar_buttons = {}
         nav_items = [
             ("Dashboard", "⊞", "dashboard"),
-            ("Google Sync", "🔄", "google_sync"),
-            ("Automations", "🤖", "automations"),
             ("Campaigns", "📢", "campaigns"),
-            ("History", "🕒", "history")
+            ("History", "🕒", "history"),
+            ("Logs", "📄", "logs")
         ]
 
         for i, (name, icon, key) in enumerate(nav_items):
@@ -304,7 +323,7 @@ class App(ctk.CTk):
         # Create different pages
         self.create_dashboard_page()
         self.create_settings_page()
-        self.create_placeholder_page("google_sync", "Google Sync - Access Credentials and Sync Logs")
+        self.create_logs_page()
         self.create_placeholder_page("campaigns", "Campaign Manager - Setup Message Sequences & Schedules")
         self.create_placeholder_page("history", "Execution History - Archived Run Records")
         self.create_placeholder_page("support", "Support Desk - Documentation & Feedback Channels")
@@ -331,16 +350,20 @@ class App(ctk.CTk):
         # Display selected page
         page_mapping = {
             "dashboard": self.dashboard_page,
-            "google_sync": self.google_sync_page,
-            "automations": self.settings_page, # Application settings
             "campaigns": self.campaigns_page,
             "history": self.history_page,
+            "logs": self.logs_page,
             "settings": self.settings_page,    # Direct config panel
             "support": self.support_page
         }
 
         self.current_page_frame = page_mapping.get(page_key, self.dashboard_page)
         self.current_page_frame.grid(row=0, column=0, sticky="nsew")
+
+        if page_key == "logs":
+            self.load_log_file()
+        elif page_key == "settings":
+            self.refresh_account_status_async()
 
     # ----------------------------------------------------
     # Page: Dashboard View (Main Layout)
@@ -364,17 +387,17 @@ class App(ctk.CTk):
         # Card 1: Contacts Found
         self.contacts_card = ctk.CTkFrame(metrics_frame, fg_color=CARD_BG, border_color=CARD_BORDER, border_width=1, corner_radius=12)
         self.contacts_card.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
-        self.create_metric_widget(self.contacts_card, "Contacts Found", "👥", "12,842", "+4.2%", ACCENT_BLUE)
+        self.create_metric_widget(self.contacts_card, "Contacts Found", "👥", "0", "", ACCENT_BLUE)
 
         # Card 2: Messages Sent
         self.messages_card = ctk.CTkFrame(metrics_frame, fg_color=CARD_BG, border_color=CARD_BORDER, border_width=1, corner_radius=12)
         self.messages_card.grid(row=0, column=1, padx=5, sticky="nsew")
-        self.create_metric_widget(self.messages_card, "Messages Sent", "✈️", "8,921", "+12%", ACCENT_GREEN)
+        self.create_metric_widget(self.messages_card, "Messages Sent", "✈️", "0", "", ACCENT_GREEN)
 
         # Card 3: Success Rate
         self.success_card = ctk.CTkFrame(metrics_frame, fg_color=CARD_BG, border_color=CARD_BORDER, border_width=1, corner_radius=12)
         self.success_card.grid(row=0, column=2, padx=(10, 0), sticky="nsew")
-        self.create_metric_widget(self.success_card, "Success Rate", "🛡️", "99.2%", "Optimal", ACCENT_GREEN)
+        self.create_metric_widget(self.success_card, "Success Rate", "🛡️", "—", "", ACCENT_GREEN)
 
         # ----------------------------------------------------
         # Card Left: Google Integration Section
@@ -419,7 +442,8 @@ class App(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI", size=13),
             dropdown_font=ctk.CTkFont(family="Segoe UI", size=13),
             text_color=TEXT_PRIMARY,
-            height=38
+            height=38,
+            command=self.on_label_selected
         )
         self.label_dropdown.pack(padx=20, pady=(0, 15), fill="x")
 
@@ -432,19 +456,19 @@ class App(ctk.CTk):
         # Sync Status Row
         lbl_status_title = ctk.CTkLabel(status_box, text="SYNC STATUS", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=TEXT_MUTED)
         lbl_status_title.grid(row=0, column=0, padx=15, pady=(12, 4), sticky="w")
-        self.sync_status_val = ctk.CTkLabel(status_box, text="Synced  ✅", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=ACCENT_GREEN)
+        self.sync_status_val = ctk.CTkLabel(status_box, text="Not synced", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color=TEXT_MUTED)
         self.sync_status_val.grid(row=0, column=1, padx=15, pady=(12, 4), sticky="e")
 
         # Last Sync Row
         lbl_sync_title = ctk.CTkLabel(status_box, text="Last Sync", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
         lbl_sync_title.grid(row=1, column=0, padx=15, pady=4, sticky="w")
-        self.sync_time_val = ctk.CTkLabel(status_box, text="2 mins ago", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_PRIMARY)
+        self.sync_time_val = ctk.CTkLabel(status_box, text="Never", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_PRIMARY)
         self.sync_time_val.grid(row=1, column=1, padx=15, pady=4, sticky="e")
 
         # Label Count Row
         lbl_count_title = ctk.CTkLabel(status_box, text="Label Count", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_MUTED)
         lbl_count_title.grid(row=2, column=0, padx=15, pady=(4, 12), sticky="w")
-        self.label_count_val = ctk.CTkLabel(status_box, text="4,102 Contacts", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_PRIMARY)
+        self.label_count_val = ctk.CTkLabel(status_box, text="—", font=ctk.CTkFont(family="Segoe UI", size=11), text_color=TEXT_PRIMARY)
         self.label_count_val.grid(row=2, column=1, padx=15, pady=(4, 12), sticky="e")
 
         # Refresh Action Button
@@ -652,14 +676,7 @@ class App(ctk.CTk):
         self.log_textbox.configure(state="disabled")
 
         # Configure textbox logging tags color coding
-        self.log_textbox.tag_config("INFO", foreground="#10B981")     # Green
-        self.log_textbox.tag_config("SUCCESS", foreground="#34D399")  # Bright green
-        self.log_textbox.tag_config("SYNC", foreground="#60A5FA")     # Blue
-        self.log_textbox.tag_config("SYSTEM", foreground="#22D3EE")   # Cyan
-        self.log_textbox.tag_config("TASK", foreground="#E5E7EB")     # White
-        self.log_textbox.tag_config("WARNING", foreground="#F59E0B")  # Yellow
-        self.log_textbox.tag_config("ERROR", foreground="#EF4444")    # Red
-        self.log_textbox.tag_config("DEBUG", foreground="#9CA3AF")    # Muted gray
+        configure_log_tags(self.log_textbox)
 
     # Helper to build a metric card sub-widget
     def create_metric_widget(self, parent_frame, title, icon, value, sub_value, icon_color):
@@ -739,15 +756,15 @@ class App(ctk.CTk):
             self.failures_val_lbl = lbl_val
 
     # ----------------------------------------------------
-    # Page: Settings & Automations View
+    # Page: Settings View
     # ----------------------------------------------------
     def create_settings_page(self):
         self.settings_page = ctk.CTkFrame(self.pages_container, fg_color="transparent")
         self.settings_page.grid_columnconfigure(0, weight=1)
         self.settings_page.grid_rowconfigure(0, weight=1)
 
-        # Config Panel card
-        config_card = ctk.CTkFrame(self.settings_page, fg_color=CARD_BG, border_color=CARD_BORDER, border_width=1, corner_radius=12)
+        # Config Panel card (scrollable so all sections fit at the minimum window size)
+        config_card = ctk.CTkScrollableFrame(self.settings_page, fg_color=CARD_BG, border_color=CARD_BORDER, border_width=1, corner_radius=12)
         config_card.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         config_card.grid_columnconfigure(0, weight=1)
 
@@ -771,6 +788,59 @@ class App(ctk.CTk):
         # Divider line
         divider = ctk.CTkFrame(config_card, height=1, fg_color=CARD_BORDER)
         divider.pack(padx=30, pady=(0, 25), fill="x")
+
+        # Google Account (credentials) section
+        account_lbl = ctk.CTkLabel(config_card, text="Google Account", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF")
+        account_lbl.pack(padx=30, pady=(0, 4), anchor="w")
+
+        account_box = ctk.CTkFrame(config_card, fg_color="#101726", corner_radius=8)
+        account_box.pack(padx=30, pady=(0, 15), fill="x")
+        account_box.grid_columnconfigure(0, weight=1)
+        account_box.grid_columnconfigure((1, 2), weight=0)
+
+        self.account_status_lbl = ctk.CTkLabel(
+            account_box,
+            text="Checking...",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text_color=TEXT_MUTED
+        )
+        self.account_status_lbl.grid(row=0, column=0, padx=15, pady=(12, 2), sticky="w")
+
+        self.client_secrets_lbl = ctk.CTkLabel(
+            account_box,
+            text="",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color=TEXT_MUTED
+        )
+        self.client_secrets_lbl.grid(row=1, column=0, padx=15, pady=(0, 12), sticky="w")
+
+        self.account_signin_btn = ctk.CTkButton(
+            account_box,
+            text="Sign In",
+            width=130,
+            height=34,
+            fg_color=ACCENT_BLUE,
+            hover_color="#2563EB",
+            text_color="#FFFFFF",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            command=self.sign_in_google
+        )
+        self.account_signin_btn.grid(row=0, column=1, rowspan=2, padx=(0, 8), pady=12)
+
+        self.account_signout_btn = ctk.CTkButton(
+            account_box,
+            text="Sign Out",
+            width=100,
+            height=34,
+            fg_color="transparent",
+            hover_color="#271C22",
+            text_color=ACCENT_RED,
+            border_color=ACCENT_RED,
+            border_width=1,
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            command=self.sign_out_google
+        )
+        self.account_signout_btn.grid(row=0, column=2, rowspan=2, padx=(0, 15), pady=12)
 
         # 1. WhatsApp Group Invite Link input
         invite_lbl = ctk.CTkLabel(config_card, text="WhatsApp Group Invite Link", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#FFFFFF")
@@ -841,6 +911,77 @@ class App(ctk.CTk):
         )
         self.save_cfg_btn.pack(padx=30, pady=(0, 30), fill="x")
 
+    # ----------------------------------------------------
+    # Page: Logs View (contents of the log file on disk)
+    # ----------------------------------------------------
+    def create_logs_page(self):
+        self.logs_page = ctk.CTkFrame(self.pages_container, fg_color="transparent")
+        self.logs_page.grid_columnconfigure(0, weight=1)
+        self.logs_page.grid_rowconfigure(0, weight=1)
+
+        logs_card = ctk.CTkFrame(self.logs_page, fg_color=CARD_BG, border_color=CARD_BORDER, border_width=1, corner_radius=12)
+        logs_card.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        logs_card.grid_columnconfigure(0, weight=1)
+        logs_card.grid_rowconfigure(1, weight=1)
+
+        logs_header = ctk.CTkFrame(logs_card, fg_color="transparent")
+        logs_header.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
+        logs_header.grid_columnconfigure(0, weight=1)
+
+        logs_title = ctk.CTkLabel(
+            logs_header,
+            text="📄  Application Logs",
+            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+            text_color="#FFFFFF"
+        )
+        logs_title.grid(row=0, column=0, sticky="w")
+
+        self.logs_path_lbl = ctk.CTkLabel(
+            logs_header,
+            text=self.get_log_file_path(),
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color=TEXT_MUTED
+        )
+        self.logs_path_lbl.grid(row=1, column=0, sticky="w")
+
+        logs_actions = ctk.CTkFrame(logs_header, fg_color="transparent")
+        logs_actions.grid(row=0, column=1, rowspan=2, sticky="e")
+
+        refresh_logs_btn = ctk.CTkButton(
+            logs_actions,
+            text="⟳  Refresh",
+            width=110,
+            height=34,
+            fg_color="transparent",
+            hover_color="#1E293B",
+            text_color="#FFFFFF",
+            border_color="#374151",
+            border_width=1,
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            command=self.load_log_file
+        )
+        refresh_logs_btn.pack(side="left", padx=(0, 8))
+
+        open_logs_btn = ctk.CTkButton(
+            logs_actions,
+            text="Open Folder",
+            width=110,
+            height=34,
+            fg_color="transparent",
+            hover_color="#1E293B",
+            text_color="#FFFFFF",
+            border_color="#374151",
+            border_width=1,
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            command=self.open_log_folder
+        )
+        open_logs_btn.pack(side="left")
+
+        self.logs_textbox = ctk.CTkTextbox(logs_card, fg_color=TERMINAL_BG, wrap="none", font=ctk.CTkFont(family="Consolas", size=12))
+        self.logs_textbox.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="nsew")
+        configure_log_tags(self.logs_textbox)
+        self.logs_textbox.configure(state="disabled")
+
     # Helper to construct secondary placeholder layouts
     def create_placeholder_page(self, page_key, text):
         frame = ctk.CTkFrame(self.pages_container, fg_color="transparent")
@@ -858,9 +999,7 @@ class App(ctk.CTk):
         lbl.pack(expand=True)
         
         # Assign frame references
-        if page_key == "google_sync":
-            self.google_sync_page = frame
-        elif page_key == "campaigns":
+        if page_key == "campaigns":
             self.campaigns_page = frame
         elif page_key == "history":
             self.history_page = frame
@@ -955,6 +1094,8 @@ class App(ctk.CTk):
     # ----------------------------------------------------
     def load_labels_async(self):
         self.load_labels_btn.configure(state="disabled")
+        self.account_signin_btn.configure(state="disabled")
+        self.account_signout_btn.configure(state="disabled")
         self.sync_status_val.configure(text="Syncing...  🔄", text_color="#3B82F6")
         self.textbox_log("SYNC: Fetching contacts labels from Google Contacts API...")
         threading.Thread(target=self._load_labels_worker, daemon=True).start()
@@ -976,16 +1117,124 @@ class App(ctk.CTk):
         except Exception as e:
             logger.error(f"SYNC: Error loading contact groups: {e}")
             self.update_ui_state("Sync Fail  ❌", "normal", status_color=ACCENT_RED)
+        finally:
+            # A sync may have just signed someone in (or failed to), so refresh the Settings panel
+            self._refresh_account_status_worker()
 
     def _populate_labels_dropdown(self, values):
         self.label_dropdown.configure(values=values)
         self.label_dropdown.set(values[0] if values else "")
+        # set() doesn't fire the dropdown command, so refresh the count for the default label
+        if values:
+            self.on_label_selected(values[0])
+
+    def on_label_selected(self, label_name):
+        group = next(
+            (g for g in self.labels_list if g.get('formattedName', g.get('name', 'Unnamed Label')) == label_name),
+            None
+        )
+        if not group:
+            return
+        # memberCount is omitted by the API when the label is empty
+        count = group.get('memberCount', 0)
+        self.contacts_val_lbl.configure(text=f"{count:,}")
+        self.label_count_val.configure(text=f"{count:,} Contacts")
 
     def update_ui_state(self, sync_status_text, button_state, last_sync=None, status_color=ACCENT_GREEN):
         self.sync_status_val.after(0, lambda: self.sync_status_val.configure(text=sync_status_text, text_color=status_color))
         self.load_labels_btn.after(0, lambda: self.load_labels_btn.configure(state=button_state))
         if last_sync:
             self.sync_time_val.after(0, lambda: self.sync_time_val.configure(text=last_sync))
+
+    # ----------------------------------------------------
+    # Google Account (Settings page)
+    # ----------------------------------------------------
+    def refresh_account_status_async(self):
+        threading.Thread(target=self._refresh_account_status_worker, daemon=True).start()
+
+    def _refresh_account_status_worker(self):
+        secrets_text = "OAuth client: client_secrets.json found" if client_secrets_present() \
+            else "OAuth client: client_secrets.json missing from the app folder"
+        try:
+            creds = load_cached_credentials()
+            if not creds:
+                status, color, signed_in = "Not signed in", TEXT_MUTED, False
+            else:
+                email = get_account_email(creds)
+                status = f"Signed in as {email}" if email else "Signed in"
+                color, signed_in = ACCENT_GREEN, True
+        except Exception as e:
+            logger.error(f"SYSTEM: Could not read Google account status: {e}")
+            status, color, signed_in = "Sign-in expired or invalid", ACCENT_RED, False
+        self.account_status_lbl.after(0, self._apply_account_status, status, color, secrets_text, signed_in)
+
+    def _apply_account_status(self, status, color, secrets_text, signed_in):
+        self.account_status_lbl.configure(text=status, text_color=color)
+        self.client_secrets_lbl.configure(text=secrets_text)
+        self.account_signin_btn.configure(text="Switch Account" if signed_in else "Sign In", state="normal")
+        self.account_signout_btn.configure(state="normal" if signed_in else "disabled")
+
+    def _automation_running(self):
+        if self.running_thread and self.running_thread.is_alive():
+            self.textbox_log("SYSTEM: Error - Stop the running task before changing the Google account.")
+            return True
+        return False
+
+    def sign_in_google(self):
+        if self._automation_running():
+            return
+        # For "Switch Account", drop the current token so the browser sign-in opens
+        sign_out()
+        self.account_status_lbl.configure(text="Waiting for browser sign-in...", text_color=ACCENT_BLUE)
+        self.textbox_log("SYSTEM: Opening Google sign-in in your browser...")
+        self.load_labels_async()
+
+    def sign_out_google(self):
+        if self._automation_running():
+            return
+        sign_out()
+        self.labels_list = []
+        self.label_dropdown.configure(values=["Click 'Refresh Google Contacts'"])
+        self.label_dropdown.set("Click 'Refresh Google Contacts'")
+        self.contacts_val_lbl.configure(text="0")
+        self.label_count_val.configure(text="—")
+        self.sync_status_val.configure(text="Not signed in", text_color=TEXT_MUTED)
+        self.sync_time_val.configure(text="Never")
+        self.textbox_log("SYSTEM: Signed out of Google.")
+        self.refresh_account_status_async()
+
+    # ----------------------------------------------------
+    # Logs page
+    # ----------------------------------------------------
+    def get_log_file_path(self):
+        # Use the file handler's own path, since logs/ is relative to the launch directory
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.FileHandler):
+                return handler.baseFilename
+        return os.path.abspath(os.path.join("logs", "app.log"))
+
+    def load_log_file(self, max_lines=1000):
+        path = self.get_log_file_path()
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-max_lines:]
+        except FileNotFoundError:
+            lines = ["Log file not created yet.\n"]
+
+        self.logs_textbox.configure(state="normal")
+        self.logs_textbox.delete("1.0", "end")
+        for line in lines:
+            # File lines look like "time - logger - LEVEL - message"
+            parts = line.split(" - ", 3)
+            levelname = parts[2] if len(parts) == 4 else ""
+            self.logs_textbox.insert("end", line, classify_log_line(line, levelname))
+        self.logs_textbox.configure(state="disabled")
+        self.logs_textbox.see("end")
+
+    def open_log_folder(self):
+        folder = os.path.dirname(self.get_log_file_path())
+        os.makedirs(folder, exist_ok=True)
+        os.startfile(folder)
 
     # ----------------------------------------------------
     # Pause / Resume / Stop Actions
@@ -1204,8 +1453,7 @@ class App(ctk.CTk):
                     
                     if success:
                         self.sent_count += 1
-                        # Update top statistics card count: starts at mockup '8,921' base and increases
-                        self.messages_val_lbl.after(0, lambda: self.messages_val_lbl.configure(text=f"{8921 + self.sent_count:,}"))
+                        self.messages_val_lbl.after(0, lambda: self.messages_val_lbl.configure(text=f"{self.sent_count:,}"))
                     else:
                         logger.error(f"SYSTEM: Failed to dispatch message to {student_name} ({student_phone}).")
                         self.failures_count += 1

@@ -92,6 +92,12 @@ def list_contact_labels(service):
     logger.debug(f"Found {len(labels)} labels.")
     return labels
 
+def get_label_member_count(service, label_resource_name):
+    """Fetch a single label's current member count (maxMembers=0 skips the member list)."""
+    group = service.contactGroups().get(resourceName=label_resource_name, maxMembers=0).execute()
+    # memberCount is omitted by the API when the label is empty
+    return group.get('memberCount', 0)
+
 def get_contacts_from_label(service, label_resource_name):
     logger.info(f"Fetching contacts from label: {label_resource_name}")
     contacts_list = []

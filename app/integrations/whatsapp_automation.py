@@ -21,6 +21,8 @@ SEND_BUTTON_SELECTORS = [
     'span[data-icon="wds-ic-send-filled"]'
 ]
 
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif'}
+
 class WhatsAppAutomation:
     def __init__(self):
         self.driver = None
@@ -69,7 +71,7 @@ class WhatsAppAutomation:
             logger.error("Timeout waiting for WhatsApp Web login. Please scan QR code if not already logged in.")
             return False
 
-    def send_message(self, recipient_phone: str, message: str, flyer_path: str = None):
+    def send_message(self, recipient_phone: str, message: str, attachment_path: str = None, caption: str = None):
         if not self.driver:
             logger.error("Browser not launched. Call launch_browser() first.")
             return False
@@ -82,7 +84,6 @@ class WhatsAppAutomation:
             time.sleep(5) # Give WhatsApp Web time to load the chat
 
             # Wait for the message input box to be present
-            # Using a more robust selector for the message input box
             message_box = self._wait_for_any([
                 'div[data-testid="conversation-compose-box-input"]',
                 'footer div[contenteditable="true"][role="textbox"]',
@@ -92,25 +93,16 @@ class WhatsAppAutomation:
             self._type_message(message_box, message)
             time.sleep(1) # Small delay after typing message
 
-            if flyer_path and os.path.exists(flyer_path):
-                self._attach_file(flyer_path)
-
-            # Click the send button (with robust fallbacks)
-            send_button = None
-            try:
-                send_button = self._wait_for_any(SEND_BUTTON_SELECTORS, clickable=True)
-            except TimeoutException:
-                pass
-
-            if not send_button:
-                try:
-                    send_button = self.wait.until(EC.element_to_be_clickable((By.XPATH, "//span[@data-icon='send'] | //div[@aria-label='Send']")))
-                except TimeoutException:
-                    raise TimeoutException("Send button not found.")
-
-            send_button.click()
+            # Send the text on its own first, so the compose box is empty when the attachment
+            # preview opens (otherwise WhatsApp can turn the draft into the attachment caption)
+            self._click_send_button()
             logger.info(f"Message sent successfully to {recipient_phone}")
             time.sleep(2) # Delay after sending message
+
+            if attachment_path:
+                if not self._attach_file(attachment_path, caption):
+                    logger.error(f"Text was sent to {recipient_phone}, but the attachment was not.")
+                    return False
             return True
         except TimeoutException:
             logger.error(f"Timeout while sending message to {recipient_phone}. Chat or input field not found.")
@@ -122,8 +114,23 @@ class WhatsAppAutomation:
             logger.error(f"An unexpected error occurred while sending message to {recipient_phone}: {e}")
             return False
 
-    def _attach_file(self, file_path: str):
+    def _click_send_button(self):
+        send_button = None
+        try:
+            send_button = self._wait_for_any(SEND_BUTTON_SELECTORS, clickable=True)
+        except TimeoutException:
+            pass
+
+        if not send_button:
+            try:
+                send_button = self.wait.until(EC.element_to_be_clickable((By.XPATH, "//span[@data-icon='send'] | //div[@aria-label='Send']")))
+            except TimeoutException:
+                raise TimeoutException("Send button not found.")
+        send_button.click()
+
+    def _attach_file(self, file_path: str, caption: str = None) -> bool:
         logger.info(f"Attempting to attach file: {file_path}")
+        is_image = os.path.splitext(file_path)[1].lower() in IMAGE_EXTENSIONS
         try:
             # Click the attach button (trying old clip/paperclip icon and new plus icon)
             attach_selectors = [
@@ -150,13 +157,20 @@ class WhatsAppAutomation:
             attach_button.click()
             time.sleep(1.5) # Give time for attachment options to appear
 
-            # Find the input element for images/videos (usually hidden)
+            # Find the hidden file input. Images go through the "Photos & videos" input;
+            # anything else (PDF) must use the "Document" input, which accepts any type.
+            if is_image:
+                input_selectors = [
+                    'input[accept*="image/"]',
+                    'input[type="file"][accept*="image"]',
+                    'input[type="file"]'
+                ]
+            else:
+                input_selectors = [
+                    'input[type="file"][accept="*"]',
+                    'input[type="file"]:not([accept*="image"])'
+                ]
             upload_input = None
-            input_selectors = [
-                'input[accept*="image/"]',
-                'input[type="file"][accept*="image"]',
-                'input[type="file"]'
-            ]
             for selector in input_selectors:
                 found = self.driver.find_elements(By.CSS_SELECTOR, selector)
                 if found:
@@ -164,38 +178,49 @@ class WhatsAppAutomation:
                     break
 
             if not upload_input:
+                xpath = "//input[@type='file']" if is_image else "//input[@type='file' and not(contains(@accept, 'image'))]"
                 try:
-                    upload_input = self.wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='file']")))
+                    upload_input = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
                 except TimeoutException:
                     raise TimeoutException("Upload input element not found.")
-            
+
             # Send the file path to the hidden input element
             upload_input.send_keys(file_path)
             logger.info(f"File path sent to upload input: {file_path}")
             time.sleep(4) # Wait for the preview to load
 
+            if caption:
+                self._type_caption(caption)
+
             # Click the final send button for the attachment (with robust fallbacks)
-            send_attachment_button = None
-            try:
-                send_attachment_button = self._wait_for_any(SEND_BUTTON_SELECTORS, clickable=True)
-            except TimeoutException:
-                pass
-
-            if not send_attachment_button:
-                try:
-                    send_attachment_button = self.wait.until(EC.element_to_be_clickable((By.XPATH, "//span[@data-icon='send'] | //div[@aria-label='Send']")))
-                except TimeoutException:
-                    raise TimeoutException("Send attachment button not found.")
-
-            send_attachment_button.click()
-            logger.info(f"Flyer '{file_path}' attached and sent.")
+            self._click_send_button()
+            logger.info(f"Attachment '{os.path.basename(file_path)}' sent.")
             time.sleep(2) # Delay after sending attachment
+            return True
         except TimeoutException:
             logger.error(f"Timeout while attaching file {file_path}. Upload elements not found.")
         except NoSuchElementException as e:
             logger.error(f"Attachment element not found for {file_path}: {e}")
         except Exception as e:
             logger.error(f"An unexpected error occurred while attaching file {file_path}: {e}")
+        return False
+
+    def _type_caption(self, caption: str):
+        caption_selectors = [
+            'div[aria-label="Add a caption"][contenteditable="true"]',
+            'div[aria-placeholder="Add a caption"][contenteditable="true"]',
+            'div[data-testid="media-caption-input-container"] div[contenteditable="true"]'
+        ]
+        try:
+            # Short wait: the preview is already open, so a missing box means the selectors are stale
+            caption_box = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, ", ".join(caption_selectors)))
+            )
+            caption_box.click()
+            self._type_message(caption_box, caption)
+            time.sleep(0.5)
+        except TimeoutException:
+            logger.warning("Caption box not found in the attachment preview. Sending the attachment without a caption.")
 
     def close_browser(self):
         if self.driver:
@@ -225,7 +250,7 @@ if __name__ == '__main__':
         test_message = "Hello from your automation script! Please ignore this test message."
         
         if test_phone_number:
-            wa_automation.send_message(test_phone_number, test_message, flyer_path=dummy_flyer_path)
+            wa_automation.send_message(test_phone_number, test_message, attachment_path=dummy_flyer_path, caption="Test caption")
         else:
             logger.warning("No phone number provided for testing.")
     wa_automation.close_browser()

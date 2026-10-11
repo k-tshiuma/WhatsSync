@@ -88,7 +88,7 @@ def main():
             message = build_registration_message(student_name)
 
             logger.info(f"[{i+1}/{len(processed_contacts)}] Sending message to {student_name} ({student_phone})")
-            success = wa_automation.send_message(student_phone, message, flyer_path=flyer_to_attach)
+            success = wa_automation.send_message(student_phone, message, attachment_path=flyer_to_attach)
             if not success:
                 logger.error(f"Failed to send message to {student_name} ({student_phone}). Will attempt next contact.")
             

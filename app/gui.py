@@ -315,8 +315,9 @@ class App(ctk.CTk):
         self.show_phase("audience")
         self.refresh_session_status()
 
-        # Load Google Contact labels on start
-        self.load_labels_async()
+        # Load Google Contact labels once mainloop runs: a worker calling after() before then raises
+        # "main thread is not in main loop" (happens in the faster-starting exe)
+        self.after(200, self.load_labels_async)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 

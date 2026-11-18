@@ -85,7 +85,7 @@ def main():
         for i, contact in enumerate(processed_contacts):
             student_name = contact['name']
             student_phone = contact['phone']
-            message = build_registration_message(student_name)
+            message = build_registration_message(contact.get('first_name') or student_name)
 
             logger.info(f"[{i+1}/{len(processed_contacts)}] Sending message to {student_name} ({student_phone})")
             success = wa_automation.send_message(student_phone, message, attachment_path=flyer_to_attach)

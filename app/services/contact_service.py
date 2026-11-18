@@ -38,6 +38,7 @@ def analyze_contacts(contacts: List[Dict[str, Any]]) -> Dict[str, List[Dict[str,
             if normalized_phone not in seen_numbers:
                 valid.append({
                     "name": name,
+                    "first_name": contact.get("first_name") or name,
                     "phone": normalized_phone
                 })
                 seen_numbers.add(normalized_phone)

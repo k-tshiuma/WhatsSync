@@ -1,5 +1,6 @@
 import os
 import pickle
+from urllib.parse import urlparse
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -28,8 +29,12 @@ def get_google_credentials():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             logger.info("Refreshing Google access token...")
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                logger.warning(f"Could not refresh Google token ({e}). Re-authorizing...")
+                creds = None
+        if not creds:
             logger.info("Authorizing with Google for the first time...")
             if not os.path.exists(CLIENT_SECRETS_FILE):
                 logger.error(f"'{CLIENT_SECRETS_FILE}' not found. Please download it from Google Cloud Console.")
@@ -37,7 +42,16 @@ def get_google_credentials():
 
             flow = InstalledAppFlow.from_client_secrets_file(
                 CLIENT_SECRETS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
+            # A Web-type OAuth client only accepts its registered redirect URI (Google matches it exactly,
+            # trailing slash included), so prefer the URI registered in client_secrets.json over the setting
+            registered = flow.client_config.get('redirect_uris') or []
+            redirect_uri = next((u for u in registered if urlparse(u).hostname in ('localhost', '127.0.0.1')),
+                                settings.GOOGLE_REDIRECT_URI)
+            redirect = urlparse(redirect_uri)
+            creds = flow.run_local_server(
+                host=redirect.hostname or 'localhost',
+                port=redirect.port or 8080,
+                redirect_uri_trailing_slash=redirect_uri.endswith('/'))
         
         # Ensure parent folder exists
         os.makedirs(os.path.dirname(TOKEN_PICKLE_FILE), exist_ok=True)
@@ -52,7 +66,10 @@ def load_cached_credentials():
     with open(TOKEN_PICKLE_FILE, 'rb') as token:
         creds = pickle.load(token)
     if creds and not creds.valid and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except Exception:
+            return None
     return creds if creds and creds.valid else None
 
 def get_account_email(creds):
@@ -121,7 +138,10 @@ def get_contacts_from_label(service, label_resource_name):
                     break
 
             if is_member_of_label:
-                name = person.get('names', [{}])[0].get('displayName')
+                name_entry = person.get('names', [{}])[0]
+                name = name_entry.get('displayName')
+                # The greeting uses only the first name; fall back to the first word of the full name
+                first_name = name_entry.get('givenName') or (name.split()[0] if name else None)
                 phone_numbers = person.get('phoneNumbers', [])
                 primary_phone = None
                 for phone in phone_numbers:
@@ -134,6 +154,7 @@ def get_contacts_from_label(service, label_resource_name):
                 if name and primary_phone:
                     contacts_list.append({
                         "name": name,
+                        "first_name": first_name,
                         "phone": primary_phone
                     })
         

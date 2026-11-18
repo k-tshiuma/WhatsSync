@@ -934,6 +934,8 @@ class App(ctk.CTk):
         index = min(self.preview_index, count - 1) if count else 0
         recipient = recipients[index] if count else {"name": "Recipient", "phone": ""}
         name = recipient["name"]
+        # Contacts are greeted by first name; groups have no first name and keep their full name
+        greeting_name = recipient.get("first_name") or name
 
         initials = "".join(word[0] for word in name.split()[:2]).upper() or "?"
         self.avatar_lbl.configure(text=initials)
@@ -944,7 +946,7 @@ class App(ctk.CTk):
         self.media_bubble.pack_forget()
         message = self.message_input.get("1.0", "end-1c").strip()
         if message:
-            self.bubble_text_lbl.configure(text=fill_placeholders(message, name))
+            self.bubble_text_lbl.configure(text=fill_placeholders(message, greeting_name))
             self.text_bubble.pack(anchor="e", pady=(0, 8))
 
         if self.attachment_path:
@@ -961,7 +963,7 @@ class App(ctk.CTk):
                 self.media_lbl.pack(expand=True)
             caption = self.caption_input.get("1.0", "end-1c").strip()
             if caption:
-                self.media_caption_lbl.configure(text=fill_placeholders(caption, name))
+                self.media_caption_lbl.configure(text=fill_placeholders(caption, greeting_name))
                 self.media_caption_lbl.pack(fill="x", padx=10, pady=(6, 0), after=self.media_box)
             else:
                 self.media_caption_lbl.pack_forget()
@@ -1709,6 +1711,7 @@ class App(ctk.CTk):
         targets = []
         for recipient in self.current_recipients():
             name = recipient["name"]
+            greeting_name = recipient.get("first_name") or name
             is_group = self.mode == "group"
             targets.append({
                 "kind": "group" if is_group else "phone",
@@ -1716,8 +1719,8 @@ class App(ctk.CTk):
                 "name": name,
                 "number": recipient["phone"],
                 "display": f"group '{name}'" if is_group else f"{name} ({recipient['phone']})",
-                "message": render_custom_text(message, name) if message else "",
-                "caption": render_custom_text(caption, name) if caption else None,
+                "message": render_custom_text(message, greeting_name) if message else "",
+                "caption": render_custom_text(caption, greeting_name) if caption else None,
             })
 
         self.begin_run({

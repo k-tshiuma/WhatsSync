@@ -17,9 +17,11 @@ pip install -r requirements.txt
 python -m app.gui     # desktop GUI (primary entry point)
 python -m app.main    # legacy console flow
 
-# Build the Windows bundle (one-dir, windowed) into dist/gui/
+# Build the Windows bundle (one-dir, windowed) into dist/WhatsSync/WhatsSync.exe
 pyinstaller --noconfirm gui.spec
 ```
+
+The frozen exe finds `.env` and `client_secrets.json` in its own folder or up to two parent folders, so it runs in place from `dist/WhatsSync/`. If you copy the bundle elsewhere, put both files next to `WhatsSync.exe`.
 
 The repo has no test suite, linter or formatter config. `gui.spec` is gitignored (`*.spec`), so changes to it are local only.
 

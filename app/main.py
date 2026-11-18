@@ -6,7 +6,7 @@ from app.utils.logger import logger
 from app.integrations.google_contacts import get_people_service, list_contact_labels, get_contacts_from_label
 from app.services.contact_service import validate_and_deduplicate_contacts
 from app.services.whatsapp_message_builder import build_registration_message
-from app.integrations.whatsapp_automation import WhatsAppAutomation
+from app.integrations.whatsapp_automation import WhatsAppAutomation, send_delay_seconds, format_duration
 
 def main():
     logger.info("Starting WhatsApp Student Registration Automation App...")
@@ -76,10 +76,18 @@ def main():
                 logger.error("User did not log in to WhatsApp Web. Exiting automation.")
                 return
 
-        flyer_to_attach = os.path.abspath(settings.RESOLVED_FLYER_PATH)
-        if not os.path.exists(flyer_to_attach):
-            logger.warning(f"Flyer file not found at '{flyer_to_attach}'. Messages will be sent without an attachment.")
-            flyer_to_attach = None
+        # The flyer is optional: a campaign can be text only
+        flyer_to_attach = None
+        flyer_path = os.path.abspath(settings.RESOLVED_FLYER_PATH)
+        if os.path.exists(flyer_path):
+            answer = input(f"Attach the flyer '{os.path.basename(flyer_path)}' to each message? [y/N]: ").strip().lower()
+            if answer in ("y", "yes"):
+                flyer_to_attach = flyer_path
+        else:
+            logger.info(f"No flyer found at '{flyer_path}'.")
+        logger.info(f"Attachment: {os.path.basename(flyer_to_attach)}" if flyer_to_attach
+                    else "No attachment. Sending text messages only.")
+        delay_seconds = send_delay_seconds(bool(flyer_to_attach))
 
         print(f"\nStarting to send messages to {len(processed_contacts)} contacts...")
         for i, contact in enumerate(processed_contacts):
@@ -92,10 +100,10 @@ def main():
             if not success:
                 logger.error(f"Failed to send message to {student_name} ({student_phone}). Will attempt next contact.")
             
-            # Implement a delay to prevent anti-spam triggers
-            delay_seconds = 5 # You might want to make this configurable or dynamic
-            logger.info(f"Waiting for {delay_seconds} seconds before next message...")
-            time.sleep(delay_seconds)
+            # Pause between recipients to prevent anti-spam triggers (none after the last one)
+            if i < len(processed_contacts) - 1:
+                logger.info(f"Waiting {format_duration(delay_seconds)} before the next message...")
+                time.sleep(delay_seconds)
 
         logger.info("All messages attempted to be sent.")
 

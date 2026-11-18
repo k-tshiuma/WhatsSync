@@ -15,6 +15,24 @@ from webdriver_manager.chrome import ChromeDriverManager
 from app.config.settings import settings
 from app.utils.logger import logger
 
+# Pause between two recipients, to stay under WhatsApp's anti-spam limits. Sends with an
+# attachment are heavier (an upload per recipient), so they get the longer pause.
+DELAY_WITH_ATTACHMENT_SECONDS = 2 * 60
+DELAY_TEXT_ONLY_SECONDS = 30
+
+def send_delay_seconds(has_attachment: bool) -> int:
+    return DELAY_WITH_ATTACHMENT_SECONDS if has_attachment else DELAY_TEXT_ONLY_SECONDS
+
+def format_duration(seconds: int) -> str:
+    """'2 minutes', '30 seconds', '1 minute 30 seconds'."""
+    minutes, secs = divmod(int(seconds), 60)
+    parts = []
+    if minutes:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if secs or not parts:
+        parts.append(f"{secs} second{'s' if secs != 1 else ''}")
+    return " ".join(parts)
+
 SEND_BUTTON_SELECTORS = [
     'span[data-testid="send"]',
     'div[aria-label="Send"]',

@@ -18,7 +18,7 @@ from app.integrations.google_contacts import (
 )
 from app.services.contact_service import analyze_contacts
 from app.services.whatsapp_message_builder import render_custom_text
-from app.integrations.whatsapp_automation import WhatsAppAutomation
+from app.integrations.whatsapp_automation import WhatsAppAutomation, send_delay_seconds, format_duration
 
 # Light theme: WhatsApp green sidebar, white main panel
 ACCENT = "#008069"            # Sidebar, primary buttons, progress (white text on it passes contrast)
@@ -1008,7 +1008,8 @@ class App(ctk.CTk):
         summary.grid_columnconfigure(1, weight=1)
         self.review_rows = {}
         for row, (key, title) in enumerate([("campaign", "Campaign"), ("audience", "Audience"), ("recipients", "Recipients"),
-                                            ("message", "Message"), ("attachment", "Attachment"), ("caption", "Caption")]):
+                                            ("message", "Message"), ("attachment", "Attachment"), ("caption", "Caption"),
+                                            ("pacing", "Wait between")]):
             key_lbl = make_label(summary, title, color=TEXT_MUTED)
             key_lbl.grid(row=row, column=0, pady=6, sticky="nw")
             value_lbl = make_label(summary, "", weight="bold" if key == "campaign" else "normal")
@@ -1031,6 +1032,16 @@ class App(ctk.CTk):
         self.start_btn.grid(row=0, column=2, sticky="e")
         return frame
 
+    def _pacing_text(self, recipient_count):
+        delay = send_delay_seconds(bool(self.attachment_path))
+        text = f"{format_duration(delay)} per message" + (" (with attachment)" if self.attachment_path else " (text only)")
+        total_minutes = round(delay * max(recipient_count - 1, 0) / 60)
+        if total_minutes >= 1:
+            hours, minutes = divmod(total_minutes, 60)
+            total = f"{hours} h {minutes} min" if hours else f"{minutes} min"
+            text += f" · about {total} of waiting in total"
+        return text
+
     def fill_review(self):
         recipients = self.current_recipients()
         noun = "contact" if self.mode == "label" else "group"
@@ -1045,6 +1056,7 @@ class App(ctk.CTk):
             "message": message,
             "attachment": os.path.basename(self.attachment_path) if self.attachment_path else "None",
             "caption": caption,
+            "pacing": self._pacing_text(len(recipients)),
         }
         for key, (key_lbl, value_lbl) in self.review_rows.items():
             value_lbl.configure(text=values[key])
@@ -1860,20 +1872,20 @@ class App(ctk.CTk):
                     if i == len(targets) - 1:
                         break
 
-                    # Wait cooling delay
-                    delay_seconds = 5
-                    logger.info(f"SYSTEM: Cooling down for {delay_seconds} seconds to comply with anti-spam rate limits...")
-                    self._ui(self.set_live_status, f"Waiting {delay_seconds} seconds before the next message...")
+                    # Cooling delay: longer when each send carries an attachment
+                    delay_seconds = send_delay_seconds(bool(attachment_path))
+                    logger.info(f"SYSTEM: Cooling down for {format_duration(delay_seconds)} to comply with anti-spam rate limits...")
 
-                    # Responsive sleep interval
-                    for _ in range(delay_seconds * 2):
+                    # Responsive sleep, with a countdown in the live status
+                    remaining = delay_seconds
+                    while remaining > 0 and not self.is_stopped:
+                        while self.is_paused and not self.is_stopped:
+                            time.sleep(0.5)
                         if self.is_stopped:
                             break
-                        while self.is_paused:
-                            if self.is_stopped:
-                                break
-                            time.sleep(0.5)
-                        time.sleep(0.5)
+                        self._ui(self.set_live_status, f"Waiting {format_duration(remaining)} before the next message...")
+                        time.sleep(1)
+                        remaining -= 1
 
                 if self.is_stopped:
                     run["end_reason"] = "Stopped before sending"

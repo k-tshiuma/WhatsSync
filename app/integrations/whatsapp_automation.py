@@ -1,3 +1,4 @@
+import re
 import time
 import os
 import psutil
@@ -101,6 +102,123 @@ if (window.__wsOrigInputClick) {
     window.__wsOrigShowPicker = null;
 }
 """
+
+# Reading a group's members (English WhatsApp Web). The group info panel lists the first
+# members and a "View all (N more)" button that opens the full, virtualized list.
+VIEW_ALL_MEMBERS_XPATH = "//*[starts-with(normalize-space(text()), 'View all')]"
+# Outside the chat and the chat list, so a message or a preview like "Group members have changed"
+# is never read as the count
+MEMBER_COUNT_XPATH = ("//*[not(ancestor::*[@id='main']) and not(ancestor::*[@id='pane-side'])]"
+                      "[contains(normalize-space(text()), ' members') or contains(normalize-space(text()), ' participants')]")
+# The group info side panel
+GROUP_INFO_PANEL_SELECTORS = [
+    'div[data-testid="chat-info-drawer"]',
+    'section[data-testid="group-info-drawer-body"]',
+    'div[role="complementary"][aria-label="Group info"]',
+]
+# Containers the member list can be in, most specific first: the "View all" dialog, then the side panel
+MEMBER_LIST_ROOT_SELECTORS = [
+    'div[data-testid="contacts-modal"]',
+    'div[data-animate-modal-popup="true"]',
+    'div[role="dialog"]',
+    'div[data-testid="drawer-right"]',
+    'div[data-testid="chat-info-drawer"]',
+]
+DIALOG_ROOT_COUNT = 3  # The first selectors above are dialogs, the rest are the side panel
+# Most specific first: the list also has letter headings ("#", "E", "~") as list items
+MEMBER_ROW_SELECTORS = [
+    'div[data-testid="cell-frame-container"]',
+    'div[role="listitem"]',
+    'div[role="row"]',
+]
+# Rows in the group info panel that are actions, not members
+NON_MEMBER_ROWS = {"add member", "add members", "invite to group via link", "invite via link", "exit group",
+                   "report group", "view all", "community", "add participant", "add participants"}
+
+# Finds the open member list: a known container, or else the nearest ancestor of the
+# "N members" text that holds member rows. Shared by the read and scroll scripts below.
+FIND_MEMBER_LIST_JS = """
+const rootSelectors = arguments[0], rowSelectors = arguments[1].join(', '), dialogCount = arguments[2];
+const visible = el => el && el.getClientRects().length > 0;
+let root = null, isDialog = false;
+rootSelectors.some((sel, i) => {
+    const roots = Array.from(document.querySelectorAll(sel)).filter(visible).filter(el => el.querySelector(rowSelectors));
+    if (roots.length) { root = roots[roots.length - 1]; isDialog = i < dialogCount; }
+    return !!root;
+});
+if (!root) {
+    const counter = Array.from(document.querySelectorAll('#app span, #app div'))
+        .find(el => visible(el) && el.children.length === 0 && /\\b\\d[\\d,.]*\\s+(members|participants)\\b/i.test((el.textContent || '').trim()));
+    let el = counter;
+    while (el && el !== document.body && !el.querySelector(rowSelectors)) { el = el.parentElement; }
+    if (el && el !== document.body) { root = el; }
+}
+"""
+
+# Returns the member rows currently drawn in the list as their text lines
+READ_MEMBER_ROWS_JS = FIND_MEMBER_LIST_JS + """
+if (!root) { return {found: false, dialog: false, rows: []}; }
+// Use the most specific row selector that matches, so headings between rows are left out
+const rowSel = arguments[1].find(sel => root.querySelector(sel));
+const all = Array.from(root.querySelectorAll(rowSel)).filter(row => !row.querySelector('[data-testid="section-header"]'));
+// A row nested in another row is the same member; keep the outer one
+const rows = all.filter(row => !all.some(other => other !== row && other.contains(row)));
+return {
+    found: true,
+    dialog: isDialog,
+    rows: rows.map(row => ({
+        titles: Array.from(row.querySelectorAll('span[title]')).map(s => s.getAttribute('title').trim()).filter(Boolean),
+        lines: (row.innerText || '').split('\\n').map(l => l.trim()).filter(Boolean)
+    }))
+};
+"""
+
+# Scrolls the member list down by most of a screen; returns false once it can't scroll further
+SCROLL_MEMBER_LIST_JS = FIND_MEMBER_LIST_JS + """
+let el = root ? root.querySelector(rowSelectors) : null;
+while (el && el !== document.body) {
+    const style = getComputedStyle(el);
+    if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 5) {
+        const before = el.scrollTop;
+        el.scrollTop = before + el.clientHeight * 0.8;
+        return el.scrollTop > before;
+    }
+    el = el.parentElement;
+}
+return false;
+"""
+
+PHONE_LINE = re.compile(r"^\+?[\d\s\-().‪‬ ]{7,}$")
+
+def _looks_like_phone(text: str) -> bool:
+    return bool(PHONE_LINE.match(text)) and sum(ch.isdigit() for ch in text) >= 7
+
+def _clean_phone(text: str) -> str:
+    """'+1 (555) 123-4567' -> '+15551234567'."""
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return ("+" if text.strip().lstrip("‪").startswith("+") else "") + digits
+
+def parse_member_row(titles, lines):
+    """Turn one member row's text into {name, phone, push_name}, or None if it is not a member.
+
+    A saved contact shows only its saved name. Someone not in your phone's contacts shows
+    their number, and usually their WhatsApp profile name as "~Name".
+    """
+    texts = titles + [l for l in lines if l not in titles]
+    if not texts:
+        return None
+    first = texts[0]
+    if first.lower() in NON_MEMBER_ROWS or first.lower().startswith("view all"):
+        return None
+    if len(texts) == 1 and len(first) <= 1:
+        return None # A letter heading of the list ("#", "E", "~")
+    if first.lower() == "you":
+        return {"self": True}
+    phone = next((_clean_phone(t) for t in texts if _looks_like_phone(t)), None)
+    push_name = next((t.lstrip("~").strip() for t in texts if t.startswith("~")), None)
+    # A number or a "~profile name" first means WhatsApp shows no saved name for this member
+    name = push_name if _looks_like_phone(first) or first.startswith("~") else first
+    return {"name": name, "phone": phone, "push_name": push_name}
 
 def _xpath_literal(value: str) -> str:
     """Quote a string for use in XPath, including names that contain quotes."""
@@ -517,6 +635,100 @@ class WhatsAppAutomation:
             time.sleep(0.5)
         except TimeoutException:
             logger.warning("Caption box not found in the attachment preview. Sending the attachment without a caption.")
+
+    def get_group_participants(self, group_name: str, should_stop=None):
+        """Read the members of a group you belong to.
+
+        Returns a list of {name, phone, push_name} (phone or name can be None: a saved contact
+        shows no number, and WhatsApp can hide the number of someone you haven't saved), or
+        None if the group's member list could not be opened. Your own row is left out.
+        """
+        should_stop = should_stop or (lambda: False)
+        if not self.driver:
+            logger.error("Browser not launched. Call launch_browser() first.")
+            return None
+        logger.info(f"Reading the members of group '{group_name}'...")
+        if not self._open_group_chat(group_name):
+            return None
+        if not self._open_group_info(group_name):
+            return None
+
+        expected = self._member_count()
+        # Large groups only show some members until "View all" opens the full list
+        try:
+            view_all = WebDriverWait(self.driver, 3).until(EC.element_to_be_clickable((By.XPATH, VIEW_ALL_MEMBERS_XPATH)))
+            self.driver.execute_script("arguments[0].click();", view_all)
+            time.sleep(2) # Give the member list dialog time to open
+        except TimeoutException:
+            pass # Small group: every member is already in the panel
+
+        members, seen = [], set()
+        stalled = 0
+        for _ in range(500): # Upper bound: more than enough scrolls for WhatsApp's 1024-member limit
+            if should_stop():
+                logger.info("Stopped while reading group members.")
+                break
+            result = self.driver.execute_script(READ_MEMBER_ROWS_JS, MEMBER_LIST_ROOT_SELECTORS,
+                                                MEMBER_ROW_SELECTORS, DIALOG_ROOT_COUNT)
+            if not result.get("found"):
+                logger.error("Could not find the member list in the group info panel. WhatsApp Web may have changed its layout.")
+                self._close_panels()
+                return None
+            new_rows = 0
+            for row in result["rows"]:
+                key = "\n".join(row["titles"] + row["lines"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                member = parse_member_row(row["titles"], row["lines"])
+                if member and not member.get("self"):
+                    members.append(member)
+                    new_rows += 1
+            scrolled = self.driver.execute_script(SCROLL_MEMBER_LIST_JS, MEMBER_LIST_ROOT_SELECTORS,
+                                                  MEMBER_ROW_SELECTORS, DIALOG_ROOT_COUNT)
+            # The list loads rows lazily, so only stop after a few scrolls that bring nothing new
+            stalled = stalled + 1 if (not scrolled and not new_rows) else 0
+            if stalled >= 3:
+                break
+            time.sleep(0.8)
+
+        self._close_panels()
+        # "N members" counts you too
+        if expected and len(members) < expected - 1:
+            logger.warning(f"Read {len(members)} of the {expected - 1} other members of '{group_name}'. "
+                           "Some rows may not have loaded; try again if many are missing.")
+        logger.info(f"Read {len(members)} members from group '{group_name}'.")
+        return members
+
+    def _open_group_info(self, group_name: str) -> bool:
+        name_literal = _xpath_literal(group_name)
+        panel = ", ".join(GROUP_INFO_PANEL_SELECTORS)
+        try:
+            title = self.driver.find_element(
+                By.XPATH, f"//div[@id='main']//header//*[@title={name_literal} or normalize-space(text())={name_literal}]")
+            # A script click on the title does not open the panel; it needs a real mouse click
+            ActionChains(self.driver).move_to_element(title).click().perform()
+            WebDriverWait(self.driver, 10).until(EC.any_of(
+                EC.visibility_of_element_located((By.CSS_SELECTOR, panel)),
+                EC.visibility_of_element_located((By.XPATH, MEMBER_COUNT_XPATH))))
+            time.sleep(1.5) # Let the member rows render
+            return True
+        except (TimeoutException, NoSuchElementException):
+            logger.error(f"Could not open the group info for '{group_name}'.")
+            return False
+
+    def _member_count(self):
+        for element in self.driver.find_elements(By.XPATH, MEMBER_COUNT_XPATH):
+            match = re.search(r"(\d[\d,.]*)\s+(members|participants)", element.text or "")
+            if match:
+                return int(re.sub(r"[,.]", "", match.group(1)))
+        return None
+
+    def _close_panels(self):
+        # Escape closes the member dialog, then the group info panel
+        for _ in range(2):
+            ActionChains(self.driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(0.5)
 
     def close_browser(self):
         # Safe to call twice (the run's cleanup and closing the app window can both call it)

@@ -28,10 +28,15 @@ The repo has no test suite, linter or formatter config. `gui.spec` is gitignored
 ## Architecture
 
 Pipeline (the GUI and the console version run the same steps):
-1. `integrations/google_contacts.py`: OAuth via `client_secrets.json` with `InstalledAppFlow`. The token is cached in `data/token.pickle` (read-only contacts scope). `get_contacts_from_label` lists **all** connections and filters by `contactGroupMembership` on the client side. It prefers the `mobile` number and otherwise uses the first one.
+1. `integrations/google_contacts.py`: OAuth via `client_secrets.json` with `InstalledAppFlow`. The token is cached in `data/token.pickle` (read/write `contacts` scope, needed by the group import). `get_contacts_from_label` lists **all** connections and filters by `contactGroupMembership` on the client side. It prefers the `mobile` number and otherwise uses the first one.
 2. `services/contact_service.py`: normalizes numbers to E.164 with `phonenumbers` using `DEFAULT_COUNTRY`, and dedupes by normalized number.
 3. `services/whatsapp_message_builder.py`: renders the Jinja2 template `templates/registration_message.txt` with `name` and `group_link`. If rendering fails, it falls back to a hardcoded message.
 4. `integrations/whatsapp_automation.py`: Selenium Chrome with a persistent `--user-data-dir` (the WhatsApp session folder), so the QR login is kept between runs. It opens `web.whatsapp.com/send?phone=…`, types the message, then attaches the flyer through the hidden file `<input>`. It uses `webdriver_manager` to get chromedriver. The DOM selectors break easily: each step tries a list of fallback CSS/XPath selectors (`data-testid`, `data-icon`, `aria-label`). When WhatsApp Web changes, add new selectors to those lists instead of replacing them.
+
+Import a WhatsApp group (the GUI's "Import group" page, not in the console version):
+1. `WhatsAppAutomation.get_group_participants` opens the group's info panel and "View all", then scrolls the virtualized member list and reads each row's text (`parse_member_row`). A saved contact shows only a name, and WhatsApp can hide numbers, so a member may have no phone.
+2. `services/group_import_service.plan_import` matches members to existing Google contacts by number (or by exact, unique name when there is no number), and marks each one create / add / skip. Nothing is written until the user confirms.
+3. `google_contacts.find_or_create_label`, `create_contacts_in_label` (batches of 200, created already in the label) and `add_contacts_to_label` (batches of 1000) write it. After an import, the preview is cleared so a second press can't create duplicates.
 
 Configuration (`app/config/settings.py`):
 - A pydantic-settings `Settings` singleton loaded from `.env`. `find_env_file()` checks the base path, then up to two parent directories, then the current working directory. `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `WHATSAPP_GROUP_INVITE_LINK` are required, so importing anything from `app` fails if they are missing.

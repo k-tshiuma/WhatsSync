@@ -8,7 +8,8 @@ from app.config.settings import settings
 from app.utils.logger import logger
 
 SCOPES = [
-    'https://www.googleapis.com/auth/contacts.readonly',
+    # Read and write: importing a WhatsApp group creates contacts and a label
+    'https://www.googleapis.com/auth/contacts',
     # Lets the Settings page show which account is signed in
     'openid',
     'https://www.googleapis.com/auth/userinfo.email'
@@ -164,3 +165,90 @@ def get_contacts_from_label(service, label_resource_name):
             
     logger.info(f"Retrieved {len(contacts_list)} contacts from label {label_resource_name}.")
     return contacts_list
+
+# People API limits for one request
+BATCH_CREATE_MAX = 200
+LABEL_MODIFY_MAX = 1000
+# Retries with backoff on rate limits (429) and server errors
+API_RETRIES = 5
+
+def list_all_contacts(service):
+    """Every contact's resource name, display name and phone numbers (for matching before an import)."""
+    people = []
+    page_token = None
+    while True:
+        results = service.people().connections().list(
+            resourceName='people/me',
+            pageSize=1000,
+            personFields='names,phoneNumbers',
+            pageToken=page_token
+        ).execute(num_retries=API_RETRIES)
+        for person in results.get('connections', []):
+            names = person.get('names', [])
+            people.append({
+                "resourceName": person['resourceName'],
+                "name": names[0].get('displayName') if names else None,
+                "phones": [p.get('value') for p in person.get('phoneNumbers', []) if p.get('value')],
+            })
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
+    logger.info(f"Read {len(people)} existing Google contacts.")
+    return people
+
+def find_or_create_label(service, name):
+    """Return the resource name of the user label called `name`, creating it if there is none."""
+    for label in list_contact_labels(service):
+        if label.get('groupType') == 'USER_CONTACT_GROUP' and \
+                name.casefold() in (label.get('name', '').casefold(), label.get('formattedName', '').casefold()):
+            logger.info(f"Using the existing label '{name}'.")
+            return label['resourceName']
+    created = service.contactGroups().create(body={"contactGroup": {"name": name}}).execute(num_retries=API_RETRIES)
+    logger.info(f"Created the label '{name}'.")
+    return created['resourceName']
+
+def create_contacts_in_label(service, contacts, label_resource_name, should_stop=None):
+    """Create contacts ({name, phone}) already filed under the label. Returns how many were created.
+
+    People API writes for one account must be sent one after another, so batches run in order.
+    """
+    should_stop = should_stop or (lambda: False)
+    created = 0
+    for start in range(0, len(contacts), BATCH_CREATE_MAX):
+        if should_stop():
+            break
+        chunk = contacts[start:start + BATCH_CREATE_MAX]
+        body = {
+            "contacts": [{"contactPerson": {
+                "names": [{"unstructuredName": c["name"]}],
+                "phoneNumbers": [{"value": c["phone"], "type": "mobile"}],
+                "memberships": [
+                    {"contactGroupMembership": {"contactGroupResourceName": label_resource_name}},
+                    # Listed too, so setting memberships can't leave the contact out of "My contacts"
+                    {"contactGroupMembership": {"contactGroupResourceName": "contactGroups/myContacts"}},
+                ],
+            }} for c in chunk],
+            "readMask": "names",
+        }
+        response = service.people().batchCreateContacts(body=body).execute(num_retries=API_RETRIES)
+        created += len(response.get('createdPeople', []))
+        logger.info(f"Created {created} of {len(contacts)} new contacts.")
+    return created
+
+def add_contacts_to_label(service, resource_names, label_resource_name, should_stop=None):
+    """Add existing contacts to the label. Returns how many were added."""
+    should_stop = should_stop or (lambda: False)
+    added = 0
+    for start in range(0, len(resource_names), LABEL_MODIFY_MAX):
+        if should_stop():
+            break
+        chunk = resource_names[start:start + LABEL_MODIFY_MAX]
+        response = service.contactGroups().members().modify(
+            resourceName=label_resource_name, body={"resourceNamesToAdd": chunk}
+        ).execute(num_retries=API_RETRIES)
+        # The API lists contacts it could not add (for example, one deleted since the preview)
+        missing = response.get('notFoundResourceNames', [])
+        if missing:
+            logger.warning(f"{len(missing)} existing contacts were not found and were not added to the label.")
+        added += len(chunk) - len(missing)
+    return added

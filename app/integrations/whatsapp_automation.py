@@ -106,21 +106,30 @@ if (window.__wsOrigInputClick) {
 # Reading a group's members (English WhatsApp Web). The group info panel lists the first
 # members and a "View all (N more)" button that opens the full, virtualized list.
 VIEW_ALL_MEMBERS_XPATH = "//*[starts-with(normalize-space(text()), 'View all')]"
-# Outside #main, so a chat message that mentions "members" is never read as the count
-MEMBER_COUNT_XPATH = ("//*[not(ancestor::*[@id='main'])][contains(normalize-space(text()), ' members') or "
-                      "contains(normalize-space(text()), ' participants')]")
+# Outside the chat and the chat list, so a message or a preview like "Group members have changed"
+# is never read as the count
+MEMBER_COUNT_XPATH = ("//*[not(ancestor::*[@id='main']) and not(ancestor::*[@id='pane-side'])]"
+                      "[contains(normalize-space(text()), ' members') or contains(normalize-space(text()), ' participants')]")
+# The group info side panel
+GROUP_INFO_PANEL_SELECTORS = [
+    'div[data-testid="chat-info-drawer"]',
+    'section[data-testid="group-info-drawer-body"]',
+    'div[role="complementary"][aria-label="Group info"]',
+]
 # Containers the member list can be in, most specific first: the "View all" dialog, then the side panel
 MEMBER_LIST_ROOT_SELECTORS = [
+    'div[data-testid="contacts-modal"]',
     'div[data-animate-modal-popup="true"]',
     'div[role="dialog"]',
     'div[data-testid="drawer-right"]',
     'div[data-testid="chat-info-drawer"]',
 ]
-DIALOG_ROOT_COUNT = 2  # The first selectors above are dialogs, the rest are the side panel
+DIALOG_ROOT_COUNT = 3  # The first selectors above are dialogs, the rest are the side panel
+# Most specific first: the list also has letter headings ("#", "E", "~") as list items
 MEMBER_ROW_SELECTORS = [
+    'div[data-testid="cell-frame-container"]',
     'div[role="listitem"]',
     'div[role="row"]',
-    'div[data-testid="cell-frame-container"]',
 ]
 # Rows in the group info panel that are actions, not members
 NON_MEMBER_ROWS = {"add member", "add members", "invite to group via link", "invite via link", "exit group",
@@ -149,7 +158,9 @@ if (!root) {
 # Returns the member rows currently drawn in the list as their text lines
 READ_MEMBER_ROWS_JS = FIND_MEMBER_LIST_JS + """
 if (!root) { return {found: false, dialog: false, rows: []}; }
-const all = Array.from(root.querySelectorAll(rowSelectors));
+// Use the most specific row selector that matches, so headings between rows are left out
+const rowSel = arguments[1].find(sel => root.querySelector(sel));
+const all = Array.from(root.querySelectorAll(rowSel)).filter(row => !row.querySelector('[data-testid="section-header"]'));
 // A row nested in another row is the same member; keep the outer one
 const rows = all.filter(row => !all.some(other => other !== row && other.contains(row)));
 return {
@@ -199,6 +210,8 @@ def parse_member_row(titles, lines):
     first = texts[0]
     if first.lower() in NON_MEMBER_ROWS or first.lower().startswith("view all"):
         return None
+    if len(texts) == 1 and len(first) <= 1:
+        return None # A letter heading of the list ("#", "E", "~")
     if first.lower() == "you":
         return {"self": True}
     phone = next((_clean_phone(t) for t in texts if _looks_like_phone(t)), None)
@@ -689,13 +702,16 @@ class WhatsAppAutomation:
 
     def _open_group_info(self, group_name: str) -> bool:
         name_literal = _xpath_literal(group_name)
+        panel = ", ".join(GROUP_INFO_PANEL_SELECTORS)
         try:
             title = self.driver.find_element(
                 By.XPATH, f"//div[@id='main']//header//*[@title={name_literal} or normalize-space(text())={name_literal}]")
-            # The click bubbles up to the header, which opens the group info panel
-            self.driver.execute_script("arguments[0].click();", title)
-            WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((By.XPATH, MEMBER_COUNT_XPATH)))
-            time.sleep(1) # Let the member rows render
+            # A script click on the title does not open the panel; it needs a real mouse click
+            ActionChains(self.driver).move_to_element(title).click().perform()
+            WebDriverWait(self.driver, 10).until(EC.any_of(
+                EC.visibility_of_element_located((By.CSS_SELECTOR, panel)),
+                EC.visibility_of_element_located((By.XPATH, MEMBER_COUNT_XPATH))))
+            time.sleep(1.5) # Let the member rows render
             return True
         except (TimeoutException, NoSuchElementException):
             logger.error(f"Could not open the group info for '{group_name}'.")

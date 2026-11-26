@@ -3,7 +3,7 @@ from typing import List, Dict, Any
 from app.config.settings import settings
 from app.utils.logger import logger
 
-def normalize_phone_number(phone_number: str, default_country: str | None = None) -> str | None:
+def normalize_phone_number(phone_number: str, default_country: str | None = None, log_failures: bool = True) -> str | None:
     # Read at call time so a country changed in the GUI applies without a restart
     default_country = default_country or settings.DEFAULT_COUNTRY
     try:
@@ -11,11 +11,12 @@ def normalize_phone_number(phone_number: str, default_country: str | None = None
         if phonenumbers.is_valid_number(parsed_number):
             # Format to E.164 which is recommended for WhatsApp
             return phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.E164)
-        else:
+        if log_failures:
             logger.warning(f"Invalid phone number after parsing: {phone_number}")
-            return None
+        return None
     except phonenumbers.phonenumberutil.NumberParseException as e:
-        logger.warning(f"Could not parse phone number '{phone_number}': {e}")
+        if log_failures:
+            logger.warning(f"Could not parse phone number '{phone_number}': {e}")
         return None
 
 def analyze_contacts(contacts: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, str]]]:

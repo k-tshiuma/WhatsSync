@@ -14,9 +14,11 @@ from app.config.settings import settings
 from app.utils.logger import logger
 from app.integrations.google_contacts import (
     get_people_service, list_contact_labels, get_contacts_from_label,
-    load_cached_credentials, get_account_email, sign_out, client_secrets_present
+    load_cached_credentials, get_account_email, sign_out, client_secrets_present,
+    list_all_contacts, find_or_create_label, create_contacts_in_label, add_contacts_to_label
 )
 from app.services.contact_service import analyze_contacts
+from app.services.group_import_service import plan_import, summarize, ACTION_CREATE, ACTION_ADD, ACTION_SKIP
 from app.services.whatsapp_message_builder import render_custom_text
 from app.integrations.whatsapp_automation import WhatsAppAutomation, send_delay_seconds, format_duration
 
@@ -83,6 +85,8 @@ DEFAULT_MESSAGE = (
 
 # Recipient table: label and row tag per send status
 STATUS_LABELS = {"queued": "Queued", "sending": "Sending", "sent": "Sent", "failed": "Failed", "skipped": "Skipped"}
+# Import preview table: what happens to each WhatsApp group member
+IMPORT_ACTION_LABELS = {ACTION_CREATE: "Create", ACTION_ADD: "Add to label", ACTION_SKIP: "Skip"}
 
 ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("green")
@@ -297,6 +301,11 @@ class App(ctk.CTk):
         # hold the Chrome profile and make the next run fail to start
         self.active_wa = None
 
+        # Import from a WhatsApp group
+        self.import_rows = []
+        self.import_group = ""
+        self.import_stopped = False
+
         self.history = self._load_history()
 
         self._setup_ttk_style()
@@ -355,7 +364,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(brand, text="WhatsSync", text_color="#FFFFFF", font=font(19, "bold")).pack(side="left", padx=(12, 0))
 
         self.nav_buttons = {}
-        for i, (key, text) in enumerate([("send", "Send"), ("history", "History"), ("settings", "Settings")]):
+        for i, (key, text) in enumerate([("send", "Send"), ("import", "Import group"), ("history", "History"), ("settings", "Settings")]):
             btn = ctk.CTkButton(
                 sidebar, text=text, anchor="w", height=44, corner_radius=10,
                 fg_color="transparent", hover_color=SIDEBAR_HOVER, text_color="#FFFFFF",
@@ -403,6 +412,7 @@ class App(ctk.CTk):
 
         self.pages = {
             "send": self.create_send_page(),
+            "import": self.create_import_page(),
             "history": self.create_history_page(),
             "settings": self.create_settings_page(),
         }
@@ -458,6 +468,8 @@ class App(ctk.CTk):
     def update_header(self):
         if self.page == "history":
             title, sub = "History", "Every campaign you have run, newest first."
+        elif self.page == "import":
+            title, sub = "Import a WhatsApp group", "Save a group's members as Google contacts under a new label."
         elif self.page == "settings":
             title, sub = "Settings", "Accounts, sending defaults and logs."
         elif self.phase == "running":
@@ -1203,6 +1215,263 @@ class App(ctk.CTk):
         self.update_run_counts()
 
     # ----------------------------------------------------
+    # Page: Import a WhatsApp group (read members -> preview -> create label and contacts)
+    # ----------------------------------------------------
+    def create_import_page(self):
+        page, body = self.new_page()
+
+        source = make_card(body)
+        source.grid(row=0, column=0, sticky="ew")
+        content = ctk.CTkFrame(source, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=24, pady=24)
+        make_label(content, "1. Read the group's members", 17, "bold").pack(fill="x")
+        desc = make_label(content, "WhatsSync opens the group in WhatsApp Web and reads its member list. Nothing is "
+                                   "sent and nothing is saved to Google until you confirm below.", color=TEXT_MUTED)
+        desc.pack(fill="x", pady=(4, 0))
+        auto_wrap(desc, content)
+
+        make_label(content, "Group name", 13, "bold").pack(fill="x", pady=(18, 6))
+        row = ctk.CTkFrame(content, fg_color="transparent")
+        row.pack(fill="x")
+        self.import_group_input = make_entry(row, placeholder_text="Exactly as shown in WhatsApp")
+        self.import_group_input.pack(side="left", fill="x", expand=True)
+        self.import_group_input.bind("<Return>", lambda e: self.read_group_members())
+        self.import_read_btn = make_button(row, "Read members", self.read_group_members, width=150)
+        self.import_read_btn.pack(side="left", padx=(8, 0))
+        self.import_stop_btn = make_button(row, "Stop", self.stop_import, "danger", width=90)
+        self.import_status_lbl = make_label(content, "You must be a member of the group.", 13, color=TEXT_MUTED)
+        self.import_status_lbl.pack(fill="x", pady=(8, 0))
+        auto_wrap(self.import_status_lbl, content)
+
+        # Preview and confirm, shown once members are read
+        self.import_preview_card = make_card(body)
+        preview = ctk.CTkFrame(self.import_preview_card, fg_color="transparent")
+        preview.pack(fill="both", expand=True, padx=24, pady=24)
+        make_label(preview, "2. Check and import", 17, "bold").pack(fill="x")
+
+        tiles = ctk.CTkFrame(preview, fg_color="transparent")
+        tiles.pack(fill="x", pady=(16, 0))
+        tiles.grid_columnconfigure((0, 1, 2), weight=1, uniform="import_tiles")
+        self.import_tiles = {}
+        for col, (action, caption) in enumerate([(ACTION_CREATE, "new contacts to create"),
+                                                 (ACTION_ADD, "already in your contacts"),
+                                                 (ACTION_SKIP, "can't be imported")]):
+            tile = ctk.CTkFrame(tiles, fg_color=SURFACE, corner_radius=10)
+            tile.grid(row=0, column=col, padx=(0 if col == 0 else 6, 0 if col == 2 else 6), sticky="nsew")
+            value = make_label(tile, "—", 30, "bold")
+            value.pack(fill="x", padx=16, pady=(14, 0))
+            caption_lbl = make_label(tile, caption, 13, color=TEXT_MUTED)
+            caption_lbl.pack(fill="x", padx=16, pady=(2, 14))
+            auto_wrap(caption_lbl, tile, 32)
+            self.import_tiles[action] = value
+
+        hint = make_label(preview, "Members saved in your phone, or whose number WhatsApp hides, show only a name. "
+                                   "They are added only when exactly one of your Google contacts has that name.",
+                          13, color=TEXT_MUTED)
+        hint.pack(fill="x", pady=(12, 0))
+        auto_wrap(hint, preview)
+
+        table = make_card(preview)
+        table.pack(fill="x", pady=(16, 0))
+        tree_frame, self.import_tree = make_tree(table, [
+            ("name", "Name", 200, True), ("phone", "Number", 150, False),
+            ("action", "Action", 110, False), ("detail", "Detail", 260, True)
+        ], height=10)
+        tree_frame.pack(fill="both", expand=True, padx=1, pady=(1, 12))
+
+        make_label(preview, "Label name", 13, "bold").pack(fill="x", pady=(20, 6))
+        self.import_label_input = make_entry(preview)
+        self.import_label_input.pack(fill="x")
+        make_label(preview, "A new Google Contacts label. If you already have one with this name, it is used instead.",
+                   13, color=TEXT_MUTED).pack(fill="x", pady=(6, 0))
+
+        actions = ctk.CTkFrame(preview, fg_color="transparent")
+        actions.pack(fill="x", pady=(20, 0))
+        self.import_confirm_btn = make_button(actions, "Create label & import", self.start_import, width=200)
+        self.import_confirm_btn.pack(side="left")
+        self.import_result_lbl = make_label(actions, "", weight="bold")
+        self.import_result_lbl.pack(side="left", padx=14)
+
+        log_card = make_card(body)
+        log_card.grid(row=2, column=0, pady=(20, 0), sticky="ew")
+        make_label(log_card, "Activity log", 15, "bold").pack(fill="x", padx=20, pady=(16, 8))
+        self.import_log_textbox = make_textbox(log_card, height=200, fg_color=SURFACE, border_width=0,
+                                               font=font(12, family=MONO_FAMILY))
+        self.import_log_textbox.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        configure_log_tags(self.import_log_textbox)
+        self.import_log_textbox.configure(state="disabled")
+        return page
+
+    def _set_import_busy(self, busy, status=None):
+        set_button_enabled(self.import_read_btn, not busy)
+        set_button_enabled(self.import_confirm_btn, not busy and any(r["action"] != ACTION_SKIP for r in self.import_rows))
+        if busy:
+            self.import_stop_btn.configure(state="normal")
+            self.import_stop_btn.pack(side="left", padx=(8, 0))
+        else:
+            self.import_stop_btn.pack_forget()
+        if status is not None:
+            self.import_status_lbl.configure(text=status, text_color=TEXT_MUTED)
+
+    def _set_import_status(self, text, color=TEXT_MUTED):
+        self.import_status_lbl.configure(text=text, text_color=color)
+
+    def stop_import(self):
+        self.import_stopped = True
+        self.import_stop_btn.configure(state="disabled")
+        self.textbox_log("SYSTEM: Stop command received. Stopping the import...")
+
+    def _start_import_thread(self, target, *args):
+        self.import_stopped = False
+        self.clear_activity_log(self.import_log_textbox)
+        self.running_thread = threading.Thread(target=target, args=args, daemon=True)
+        self.running_thread.start()
+
+    def read_group_members(self):
+        group = self.import_group_input.get().strip()
+        if not group:
+            self._set_import_status("Enter the group's name first.", DANGER)
+            return
+        if self._automation_running("reading a group"):
+            self._set_import_status("Wait for the running campaign or import to finish.", DANGER)
+            return
+        self.import_rows = []
+        self.import_preview_card.grid_forget()
+        self._set_import_busy(True, "Checking your Google contacts...")
+        self._start_import_thread(self._read_members_worker, group)
+
+    def _read_members_worker(self, group):
+        rows, error = None, None
+        try:
+            # Google first: an older read-only sign-in is asked to grant write access here,
+            # before the slow WhatsApp step rather than after it
+            service = get_people_service()
+            existing = list_all_contacts(service)
+            if self.import_stopped:
+                return
+
+            self._ui(self._set_import_status, "Opening WhatsApp Web in Chrome...")
+            wa = WhatsAppAutomation()
+            self.active_wa = wa
+            try:
+                wa.launch_browser()
+                self._ui(self._set_import_status, "Waiting for WhatsApp Web to load...")
+                if not self._await_whatsapp_login(wa, lambda: self.import_stopped, self._set_import_status):
+                    if not self.import_stopped:
+                        error = "WhatsApp Web login timed out."
+                    return
+                self._ui(self._set_import_status, f"Reading the members of '{group}'...")
+                members = wa.get_group_participants(group, should_stop=lambda: self.import_stopped)
+            finally:
+                wa.close_browser()
+                self.active_wa = None
+
+            if members is None:
+                error = "Could not read the group's members (see the activity log)."
+            elif self.import_stopped:
+                return
+            else:
+                rows = plan_import(members, existing)
+                counts = summarize(rows)
+                logger.info(f"SYNC: '{group}': {counts[ACTION_CREATE]} new contacts, {counts[ACTION_ADD]} existing, "
+                            f"{counts[ACTION_SKIP]} can't be imported.")
+        except Exception as e:
+            logger.error(f"SYNC: Could not read group '{group}': {e}")
+            error = str(e)
+        finally:
+            self._ui(self._apply_group_members, group, rows, error)
+            # Reading may have signed someone in again with the new permission
+            self._refresh_account_status_worker()
+
+    def _apply_group_members(self, group, rows, error):
+        self.import_rows = rows or []
+        self._set_import_busy(False)
+        if error:
+            self._set_import_status(error, DANGER)
+            return
+        if rows is None:
+            self._set_import_status("Stopped. Nothing was saved.")
+            return
+        if not rows:
+            self._set_import_status(f"No members were found in '{group}'.", DANGER)
+            return
+        self.import_group = group
+        self._set_import_status(f"Read {len(rows):,} members from '{group}'. Check them below.")
+
+        counts = summarize(rows)
+        for action, tile in self.import_tiles.items():
+            tile.configure(text=f"{counts[action]:,}")
+        self.import_tree.delete(*self.import_tree.get_children())
+        # New and existing contacts first, the ones that will be skipped last
+        for r in sorted(rows, key=lambda r: r["action"] == ACTION_SKIP):
+            self.import_tree.insert("", "end", values=(r["name"], r["phone"] or "—", IMPORT_ACTION_LABELS[r["action"]], r["detail"]),
+                                    tags=("skipped",) if r["action"] == ACTION_SKIP else ())
+        self.import_label_input.delete(0, "end")
+        self.import_label_input.insert(0, group)
+        self.import_result_lbl.configure(text="")
+        set_button_enabled(self.import_confirm_btn, counts[ACTION_CREATE] + counts[ACTION_ADD] > 0)
+        self.import_preview_card.grid(row=1, column=0, pady=(20, 0), sticky="ew")
+
+    def start_import(self):
+        label_name = self.import_label_input.get().strip()
+        if not label_name:
+            self.import_result_lbl.configure(text="Enter a label name.", text_color=DANGER)
+            return
+        if len(label_name) > NAME_MAX:
+            self.import_result_lbl.configure(text=f"Keep the label name under {NAME_MAX} characters.", text_color=DANGER)
+            return
+        if self._automation_running("importing"):
+            return
+        to_create = [r for r in self.import_rows if r["action"] == ACTION_CREATE]
+        to_add = [r["resourceName"] for r in self.import_rows if r["action"] == ACTION_ADD]
+        if not to_create and not to_add:
+            return
+        confirmed = messagebox.askyesno(
+            "Import group",
+            f"Create {len(to_create):,} new Google contacts and add {len(to_add):,} existing ones "
+            f"to the label '{label_name}'?",
+            parent=self
+        )
+        if not confirmed:
+            return
+        self.import_result_lbl.configure(text="")
+        self._set_import_busy(True, f"Saving to the label '{label_name}'...")
+        self._start_import_thread(self._import_worker, label_name, to_create, to_add)
+
+    def _import_worker(self, label_name, to_create, to_add):
+        created = added = 0
+        error = None
+        try:
+            service = get_people_service()
+            label = find_or_create_label(service, label_name)
+            created = create_contacts_in_label(service, [{"name": r["name"], "phone": r["phone"]} for r in to_create],
+                                               label, should_stop=lambda: self.import_stopped)
+            added = add_contacts_to_label(service, to_add, label, should_stop=lambda: self.import_stopped)
+            logger.info(f"SUCCESS: Label '{label_name}': {created} contacts created, {added} existing contacts added.")
+        except Exception as e:
+            logger.error(f"SYNC: Import into '{label_name}' failed: {e}")
+            error = str(e)
+        self._ui(self._finish_import, label_name, created, added, error)
+
+    def _finish_import(self, label_name, created, added, error):
+        # This preview is out of date now: importing it again would create the same contacts twice.
+        # Reading the group again shows the saved members as existing contacts.
+        self.import_rows = []
+        self._set_import_busy(False)
+        if error or self.import_stopped:
+            prefix = "Import failed" if error else "Stopped"
+            text, color = f"{prefix} after {created:,} created and {added:,} added.", DANGER if error else TEXT_MUTED
+            status = "Read the members again to import the rest."
+        else:
+            text, color = f"Done: {created:,} created, {added:,} added to '{label_name}'.", SUCCESS_TEXT
+            status = f"The label '{label_name}' is now available on the Send page."
+        self.import_result_lbl.configure(text=text, text_color=color)
+        self._set_import_status(status)
+        if created or added:
+            # Show the new label (and its count) in the Send page's label list
+            self.load_labels_async()
+
+    # ----------------------------------------------------
     # Page: History
     # ----------------------------------------------------
     def create_history_page(self):
@@ -1370,15 +1639,17 @@ class App(ctk.CTk):
     # Logging Bridge Setup
     # ----------------------------------------------------
     def setup_logging_bridge(self):
-        log_handler = TextboxLogHandler(self.log_textbox)
-        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', '%H:%M:%S'))
-        logger.addHandler(log_handler)
+        for textbox in (self.log_textbox, self.import_log_textbox):
+            log_handler = TextboxLogHandler(textbox)
+            log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', '%H:%M:%S'))
+            logger.addHandler(log_handler)
 
-    def clear_activity_log(self):
+    def clear_activity_log(self, textbox=None):
+        textbox = textbox or self.log_textbox
         try:
-            self.log_textbox.configure(state="normal")
-            self.log_textbox.delete("1.0", "end")
-            self.log_textbox.configure(state="disabled")
+            textbox.configure(state="normal")
+            textbox.delete("1.0", "end")
+            textbox.configure(state="disabled")
         except Exception:
             pass
 
@@ -1565,7 +1836,7 @@ class App(ctk.CTk):
                 status, color, signed_in = "Not signed in", TEXT_MUTED, False
             else:
                 email = get_account_email(creds)
-                status = f"Signed in as {email} · read-only access" if email else "Signed in · read-only access"
+                status = f"Signed in as {email} · contacts access" if email else "Signed in · contacts access"
                 color, signed_in = TEXT_MUTED, True
         except Exception as e:
             logger.error(f"SYSTEM: Could not read Google account status: {e}")
@@ -1715,7 +1986,7 @@ class App(ctk.CTk):
     # Starting a campaign
     # ----------------------------------------------------
     def start_campaign(self):
-        if self.running_thread and self.running_thread.is_alive():
+        if self._automation_running("starting a campaign"):
             return
         message = self.message_input.get("1.0", "end-1c").strip()
         caption = self.caption_input.get("1.0", "end-1c").strip() if self.attachment_path else ""
@@ -1794,35 +2065,13 @@ class App(ctk.CTk):
                 logger.info("SUCCESS: WhatsApp Web socket connection established")
                 self._ui(self.set_live_status, "Waiting for WhatsApp Web to load...")
 
-                # Check login or await manual QR scans
-                if not wa_automation.wait_for_login():
-                    self._ui(self.set_live_status, "Scan the QR code in the Chrome window with your phone.")
-
-                    logged_in = False
-                    for attempt in range(24): # Await up to 120s
-                        # Check for Stop/Pause during QR wait
-                        if self.is_stopped:
-                            break
-                        while self.is_paused:
-                            if self.is_stopped:
-                                break
-                            time.sleep(0.5)
-
-                        time.sleep(5)
-                        logger.info(f"SYSTEM: Re-checking login state (Attempt {attempt+1}/24)...")
-                        if wa_automation.wait_for_login():
-                            logged_in = True
-                            break
-
-                    if self.is_stopped:
-                        logger.info("SYSTEM: Login cancelled by user stop.")
-                        run["end_reason"] = "Stopped before sending"
-                        return
-
-                    if not logged_in:
-                        logger.error("SYSTEM: Authentication check timed out. User was not logged into WhatsApp Web.")
-                        run["end_reason"] = "WhatsApp Web login timed out"
-                        return
+                logged_in = self._await_whatsapp_login(wa_automation, lambda: self.is_stopped, self.set_live_status)
+                if self.is_stopped:
+                    run["end_reason"] = "Stopped before sending"
+                    return
+                if not logged_in:
+                    run["end_reason"] = "WhatsApp Web login timed out"
+                    return
 
                 self._ui(self.set_live_status, "Logged in. Sending...")
 
@@ -1909,6 +2158,29 @@ class App(ctk.CTk):
             run["end_reason"] = "The run ended with an error (see log)"
         finally:
             self._ui(self.finish_run, run)
+
+    def _await_whatsapp_login(self, wa_automation, is_stopped, set_status):
+        """Wait until WhatsApp Web is logged in, giving the user time to scan the QR code.
+
+        Returns False if the login timed out or is_stopped() became true. Honours pause.
+        """
+        if wa_automation.wait_for_login():
+            return True
+        self._ui(set_status, "Scan the QR code in the Chrome window with your phone.")
+        for attempt in range(24): # Await up to 120s
+            if is_stopped():
+                break
+            while self.is_paused and not is_stopped():
+                time.sleep(0.5)
+            time.sleep(5)
+            logger.info(f"SYSTEM: Re-checking login state (Attempt {attempt+1}/24)...")
+            if wa_automation.wait_for_login():
+                return True
+        if is_stopped():
+            logger.info("SYSTEM: Login cancelled by user stop.")
+        else:
+            logger.error("SYSTEM: Authentication check timed out. User was not logged into WhatsApp Web.")
+        return False
 
     def _wait_for_phone_sync(self):
         self.sync_waiting = True
@@ -2003,6 +2275,7 @@ class App(ctk.CTk):
             if self.sync_waiting:
                 logger.warning("SYSTEM: App closed during the phone sync wait. Recently sent messages may not appear on the phone yet.")
             self.is_stopped = True
+            self.import_stopped = True
             self.skip_sync_wait = True
             wa.close_browser()
         self.destroy()
